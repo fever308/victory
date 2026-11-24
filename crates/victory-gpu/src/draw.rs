@@ -4094,6 +4094,7 @@ mod bindless_tests {
             return; // no host GPU
         };
         let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         let (gfx_srv_uav, gfx_srv_only, compute_srv) = make_test_pipelines(&host.device);
 
         let rt = make_texture(
@@ -4272,8 +4273,6 @@ mod bindless_tests {
         state.reset(null);
         assert!(state.bindless_cache.is_none());
 
-        let _ = host.log_messages();
-        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device query.
@@ -4287,6 +4286,7 @@ mod bindless_tests {
             return;
         };
         let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         let (gfx_srv_uav, _, _) = make_test_pipelines(&host.device);
         const UAVS: u32 = 70;
         const SRVS: u32 = 70;
@@ -4329,8 +4329,6 @@ mod bindless_tests {
         for tex in &srv_textures {
             assert_eq!(list.tracked_state(tex.0), Some(SHADER_RESOURCE));
         }
-        let _ = host.log_messages();
-        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device query.
@@ -4344,6 +4342,7 @@ mod bindless_tests {
             return;
         };
         let _ = host.log_messages();
+        let errors_before = host.d3d12_errors();
         let (gfx_srv_uav, gfx_srv_only, _) = make_test_pipelines(&host.device);
         let heap = make_view_heap(16);
         let start = crate::descriptor::heap(heap.0).start;
@@ -4384,8 +4383,6 @@ mod bindless_tests {
         assert_eq!(list.tracked_state(tex_a.0), Some(SHADER_RESOURCE));
         assert_eq!(list.tracked_state(tex_b.0), Some(UNORDERED_ACCESS));
 
-        let _ = host.log_messages();
-        let errors_before = host.d3d12_errors();
         list.close();
         host.execute(&[&list]);
         // SAFETY: plain device query.
