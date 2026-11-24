@@ -1405,10 +1405,16 @@ mod tests {
         // SAFETY: page 2 is mapped read-write and aligned for `u64`.
         unsafe { (read_addr as *mut u64).write(sentinel) };
 
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let reader_stop = stop.clone();
         let reader = std::thread::spawn(move || {
             let mut reads = 0u64;
+            // SAFETY: page 2 stays mapped for the lifetime of this thread.
+            let first = unsafe { (read_addr as *const u64).read_volatile() };
+            assert_eq!(first, sentinel);
+            reads += 1;
+            let _ = ready_tx.send(());
             while !reader_stop.load(Ordering::Relaxed) {
                 // SAFETY: page 2 stays mapped for the lifetime of this thread.
                 let value = unsafe { (read_addr as *const u64).read_volatile() };
@@ -1417,6 +1423,7 @@ mod tests {
             }
             reads
         });
+        ready_rx.recv().expect("reader thread should start");
 
         let neighbor = [at(3)];
         let unmap_page = [0usize];
