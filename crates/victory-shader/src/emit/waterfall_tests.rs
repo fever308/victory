@@ -25,7 +25,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 
 /// [`build`] without its checks: the shader (validated by `dxil.dll` when
 /// present) and what lowering reported.
-fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
+pub(super) fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
     build_with_view(words, buffers.then_some(4))
 }
 
@@ -109,15 +109,31 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
 /// per one that ran, the UAV's 32 dwords. Empty when no SM 6.6 device is
 /// available: callers return early (`docs/code-standards.md`).
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    let samplers = [D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+    run_with_sampler(shader, views, point_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT))
+}
+
+/// A clamping sampler with this filter (a comparison filter compares with
+/// `D3D12_COMPARISON_FUNC_LESS_EQUAL`: the reference at most the texel).
+pub(super) fn point_sampler(filter: D3D12_FILTER) -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
+        Filter: filter,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
-    }];
+    }
+}
+
+/// [`run`] with the one sampler `sampler` at index 0.
+pub(super) fn run_with_sampler(
+    shader: &HostShader,
+    views: &[View],
+    sampler: D3D12_SAMPLER_DESC,
+) -> Vec<(&'static str, Vec<u32>)> {
+    let samplers = [sampler];
     let mut out = Vec::new();
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
@@ -593,6 +609,51 @@ fn scalar_structured_load_and_record_count_use_the_same_view() {
             for (label, result) in results {
                 assert_eq!(result, vec![expected; 32], "{label}");
             }
+        }
+    }
+}
+
+#[test]
+fn packed_buffer_load_keeps_unwritten_high_half() {
+    // VIC-BT-015: buffer_load_format_d16_x/xyz keep vdst[31:16] on the
+    // trailing VGPR; a full pair replaces the whole dword.
+    let data = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+    let buffer = || View::Buffer {
+        data: &data,
+        stride: Stride::Typed,
+    };
+    let views = [buffer(), buffer(), View::RawUav(32)];
+    for (opcode, reg, seed, want) in [
+        (0u32, 12u32, 0x5a5a_1234u32, 0x5a5a_3c00u32),
+        (1, 12, 0x5a5a_1234, 0x4000_3c00),
+        (2, 13, 0xdead_5678, 0xdead_4200),
+    ] {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E00_02FF | reg << 17,
+            seed, // v_mov_b32 v[reg], seed
+            0xE200_2000 | opcode << 18,
+            0x8003_0C02, // buffer_load_format_d16_* v12..., v2, s[12:15], 0 idxen
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xE070_1000,
+            0x800A_0010 | reg << 8, // buffer_store_dword v[reg], v16, s[40:43], 0 offen
+            0xBF81_0000,            // s_endpgm
+        ];
+        let (shader, lowered) = build_any(&words, true);
+        assert_eq!(lowered.nonuniform_handles, 0);
+        assert_eq!(lowered.d16_kept_high_halves, u32::from(opcode != 1));
+        let results = run(&shader, &views);
+        if !device_ran(&results) {
+            return;
+        }
+        for (backend, got) in results {
+            assert_eq!(got, vec![want; 32], "{backend}: {} channels", opcode + 1);
         }
     }
 }

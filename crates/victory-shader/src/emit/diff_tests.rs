@@ -236,6 +236,7 @@ fn packed_pixel_inputs_read_both_halves() {
                     pack2,
                     row2: u8::from(pack2),
                 }],
+                rsrc2: Default::default(),
                 input_addr: if flat { 0 } else { 2 },
                 db_shader_control: 0,
                 patches: vec![],

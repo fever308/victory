@@ -121,6 +121,26 @@ pub struct Desc {
     pub swizzle: Swizzle,
 }
 
+/// The mips a shader view asks for, `(MostDetailedMip, MipLevels)` where `0`
+/// or [`u32::MAX`] levels means the rest of the chain, narrowed to the
+/// resident ones so every mip a host view can sample has arrived.
+pub fn narrowed_view(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u32, u32) {
+    let (first, levels) = asked;
+    let end = if levels == 0 || levels == u32::MAX {
+        mips
+    } else {
+        first.saturating_add(levels).min(mips)
+    };
+    let (rfirst, rcount) = resident;
+    let rend = rfirst.saturating_add(rcount).min(mips);
+    // Nothing the view asked for is there: its most detailed resident mip
+    // alone (the picture is the smallest mip, not black).
+    let start = first.max(rfirst).min(rend.saturating_sub(1));
+    let stop = end.min(rend);
+    let count = stop.saturating_sub(start).max(1);
+    (start, count)
+}
+
 /// Elements along one side of mip `mip`, as data and copies see it: texels
 /// halve rounding down (to at least 1), then round up to whole elements.
 fn dim(texels: u32, mip: u32, block: u32) -> u32 {
@@ -639,6 +659,29 @@ impl Layout {
             .max()
             .unwrap_or(self.size)
             .min(self.size)
+    }
+
+    /// Resident mip window `(first, count)` for a streamed 2D texture whose
+    /// committed prefix is `committed` bytes. `None` when every mip is there,
+    /// or when the layout has no separable mip suffix (arrays, 3D,
+    /// multisample). `(first, 0)` when nothing has arrived.
+    pub fn resident_from_prefix(&self, committed: usize) -> Option<(u32, u32)> {
+        let mips = self.desc.mips;
+        if mips == 0 || self.size == 0 {
+            return None;
+        }
+        let size = self.size as usize;
+        if committed >= size {
+            return None;
+        }
+        // Only a mip-tail layout can be described by a resident prefix.
+        if self.bytes_from(mips - 1) >= self.size {
+            return None;
+        }
+        match (0..mips).find(|&mip| self.bytes_from(mip) <= committed as u64) {
+            Some(first) => Some((first, mips - first)),
+            None => Some((mips, 0)),
+        }
     }
 
     /// Copies one subresource out of tiled memory (the whole texture,
@@ -1238,6 +1281,38 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    /// A host SRV of a partly streamed texture must name only the resident
+    /// levels, and widen when more arrive (#616).
+    #[test]
+    fn host_view_mips_match_resident_levels_and_widen_when_more_arrive() {
+        let l = Layout::new(&Desc {
+            block: 4,
+            ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S)
+        })
+        .unwrap();
+        let mips = l.desc.mips;
+        assert_eq!(l.resident_from_prefix(0), Some((mips, 0)));
+        let tail = l.bytes_from(8) as usize;
+        assert_eq!(l.resident_from_prefix(tail), Some((4, 5)));
+        assert_eq!(
+            l.resident_from_prefix(l.bytes_from(2) as usize),
+            Some((2, 7))
+        );
+        assert_eq!(l.resident_from_prefix(l.size as usize), None);
+
+        // Title view of every mip; only the tail is there → host view is the tail.
+        assert_eq!(narrowed_view((0, 0), (5, 4), 9), (5, 4));
+        // More levels arrive: remake widens MostDetailedMip toward zero.
+        assert_eq!(narrowed_view((0, 0), (2, 7), 9), (2, 7));
+        assert_eq!(narrowed_view((0, 0), (0, 9), 9), (0, 9));
+        assert_eq!(narrowed_view((0, u32::MAX), (4, 5), 9), (4, 5));
+        // A view that starts inside the resident range keeps the overlap.
+        assert_eq!(narrowed_view((3, 4), (5, 4), 9), (5, 2));
+        // Asking for levels that have not arrived: the smallest resident mip.
+        assert_eq!(narrowed_view((0, 4), (6, 3), 9), (6, 1));
+        assert_eq!(narrowed_view((0, 3), (2, 7), 9), (2, 1));
     }
 
     /// The smaller mips lie first: they are read from the memory that holds

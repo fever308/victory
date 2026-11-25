@@ -585,6 +585,8 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+/// Winsock sets `*ppResult` to null on failure (`getaddrinfo` and friends);
+/// titles that free only on success still read that out-pointer (VIC-BT-023).
 fn blocked_lookup(result: *mut *mut c_void) -> i32 {
     if !result.is_null() {
         // SAFETY: a non-null result points to the caller's output slot.
@@ -1039,8 +1041,11 @@ mod tests {
         let wide = wide.as_ptr();
         let null = std::ptr::null();
         let null_mut = std::ptr::null_mut();
+        // Poison matches the VIC-BT-023 synthetic reproducer: failure must
+        // overwrite an uninitialized / garbage out-pointer with null.
+        let poison = 0xDEAD_BEEF as *mut c_void;
         let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
-            let mut result = std::ptr::dangling_mut::<c_void>();
+            let mut result = poison;
             assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
             assert!(result.is_null());
             assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
@@ -1152,7 +1157,7 @@ mod tests {
         close(u);
 
         // Forward and reverse lookups.
-        let mut result = null;
+        let mut result = 0xDEAD_BEEF as *mut c_void;
         assert_eq!(
             getaddrinfo(
                 c"example.com".as_ptr(),
@@ -1162,6 +1167,8 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+        assert!(result.is_null());
+        result = 0xDEAD_BEEF as *mut c_void;
         let name: Vec<u16> = "example.com\0".encode_utf16().collect();
         assert_eq!(
             GetAddrInfoW(
@@ -1172,6 +1179,7 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+        assert!(result.is_null());
 
         // Local machine hostname is resolvable.
         if let Some(host) = local_hostname() {

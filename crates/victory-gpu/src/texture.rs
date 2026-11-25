@@ -46,8 +46,15 @@ pub(crate) struct Staging {
     tiled_bytes: usize,
     /// Mips per array slice.
     mips: u32,
+    /// Top levels of the title's texture the host copy lacks.
+    skipped: u32,
     memory: *const u8,
+    /// Title resource this staging buffer is of: host SRVs are narrowed to
+    /// its resident mip window ([`note_resident`]).
+    resource: This,
     last: Mutex<Last>,
+    /// Monotonic resource creation sequence for epoch-based retirement.
+    born_seq: u64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -80,9 +87,34 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        set.get_or_insert_with(Default::default)
+            .insert(resource as usize);
+    }
+    // The host mip chain is complete; drop any CPU-streamed resident window
+    // so narrowed SRVs remake to the title's full range (#616).
+    note_resident(resource, None);
+}
+
+/// Whether the host GPU wrote `resource` (copy/resolve), so its contents are
+/// on the host rather than in title memory.
+pub(crate) fn is_host_written(resource: This) -> bool {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|set| set.contains(&(resource as usize)))
+}
+
+/// One level×layer of an [`alias`] copy: the source and dest subresource
+/// indices (they differ when the placed host copy dropped top mips the
+/// source kept) and the through-buffer footprints in each format.
+struct AliasPart {
+    from_sub: u32,
+    to_sub: u32,
+    written: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    read: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 }
 
 /// The buffer a texture the host writes is copied through into the texture
@@ -92,14 +124,17 @@ pub(crate) fn host_written(resource: This) {
 /// texture's layout first.
 struct Through {
     buffer: ID3D12Resource,
-    parts: Vec<(
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    )>,
+    parts: Vec<AliasPart>,
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
 const ALIAS_PARTS: u32 = 54;
+
+/// Source subresource for dest mip `mip` of `layer` when the dest host copy
+/// lacks the source's top `dropped` levels (`MipSlice + ArraySlice * MipLevels`).
+fn alias_from_sub(mip: u32, layer: u32, dropped: u32, from_mips: u32) -> u32 {
+    (mip + dropped) + layer * from_mips
+}
 
 // SAFETY: a device-local buffer only lists record copies with.
 unsafe impl Send for Through {}
@@ -113,11 +148,14 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// of `source` in another format (`crate::resource::alias_of`), up to date
 /// with what the host wrote to `source`: the texels of every level and
 /// layer are copied as they are, through a buffer (the host copies between
-/// two formats of one texel width in no other way). Recorded the first time
-/// the list reads the view and again whenever the list used `source` in another way since (wrote
-/// it, or read it itself). Leaves `placed` in the copy destination state,
-/// as [`upload`] does. False if the copy cannot be made: the caller fills
-/// the texture from title memory, as before.
+/// two formats of one texel width in no other way). When the placed host
+/// copy dropped top mips the source kept (host memory pressure), only the
+/// retained levels are copied from the matching source levels. Recorded the
+/// first time the list reads the view and again whenever the list used
+/// `source` in another way since (wrote it, or read it itself). Leaves
+/// `placed` in the copy destination state, as [`upload`] does. False if the
+/// copy cannot be made: the caller fills the texture from title memory, as
+/// before.
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
@@ -137,31 +175,51 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             None => {
                 // SAFETY: live textures.
                 let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
-                // Levels times layers (a volume's slices are one part).
-                let count = |d: &D3D12_RESOURCE_DESC| {
-                    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                let layers = |d: &D3D12_RESOURCE_DESC| {
+                    if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
                         1
                     } else {
                         u32::from(d.DepthOrArraySize)
-                    };
-                    u32::from(d.MipLevels) * layers
+                    }
                 };
-                let parts = count(&of_from);
-                if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
+                let (from_mips, to_mips) =
+                    (u32::from(of_from.MipLevels), u32::from(of_to.MipLevels));
+                let (from_layers, to_layers) = (layers(&of_from), layers(&of_to));
+                // The placed host may have dropped top mips the source kept;
+                // dest level 0 is then source level `dropped`.
+                if to_mips == 0
+                    || from_mips < to_mips
+                    || from_layers != to_layers
+                    || from_layers == 0
+                {
                     return false;
                 }
-                let mut rows = [(); 2]
-                    .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
+                let dropped = from_mips - to_mips;
+                if dropped > 0
+                    && (of_to.Width != (of_from.Width >> dropped).max(1)
+                        || of_to.Height != (of_from.Height >> dropped).max(1))
+                {
+                    return false;
+                }
+                let parts = to_mips.saturating_mul(to_layers);
+                let from_total = from_mips.saturating_mul(from_layers);
+                if parts == 0 || parts > ALIAS_PARTS || from_total > ALIAS_PARTS {
+                    return false;
+                }
+                let mut from_rows =
+                    vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); from_total as usize];
+                let mut to_rows =
+                    vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize];
                 let mut bytes = [0u64; 2];
                 // SAFETY: plain queries; the out pointers are ours and
-                // hold `parts` layouts each.
+                // hold every subresource layout of each texture.
                 unsafe {
                     host.device.GetCopyableFootprints(
                         &of_from,
                         0,
-                        parts,
+                        from_total,
                         0,
-                        Some(rows[0].as_mut_ptr()),
+                        Some(from_rows.as_mut_ptr()),
                         None,
                         None,
                         Some(&mut bytes[0]),
@@ -171,22 +229,42 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                         0,
                         parts,
                         0,
-                        Some(rows[1].as_mut_ptr()),
+                        Some(to_rows.as_mut_ptr()),
                         None,
                         None,
                         Some(&mut bytes[1]),
                     );
                 }
-                let alike = rows[0].iter().zip(&rows[1]).all(|(a, b)| {
-                    let (fa, fb) = (a.Footprint, b.Footprint);
-                    a.Offset == b.Offset
-                        && (fa.Width, fa.Height, fa.Depth, fa.RowPitch)
-                            == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
-                });
-                if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
+                if bytes[1] == 0 {
                     return false;
                 }
-                let Some(buffer) = host.default_buffer(bytes[0]) else {
+                // Pack the through buffer as the dest lays out its levels;
+                // pair each with the source level that has the same size.
+                let mut paired = Vec::with_capacity(parts as usize);
+                for layer in 0..to_layers {
+                    for mip in 0..to_mips {
+                        let from_sub = alias_from_sub(mip, layer, dropped, from_mips);
+                        let to_sub = mip + layer * to_mips;
+                        let src = from_rows[from_sub as usize];
+                        let dst = to_rows[to_sub as usize];
+                        let (fs, fd) = (src.Footprint, dst.Footprint);
+                        if (fs.Width, fs.Height, fs.Depth, fs.RowPitch)
+                            != (fd.Width, fd.Height, fd.Depth, fd.RowPitch)
+                        {
+                            return false;
+                        }
+                        paired.push(AliasPart {
+                            from_sub,
+                            to_sub,
+                            written: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: dst.Offset,
+                                Footprint: fs,
+                            },
+                            read: dst,
+                        });
+                    }
+                }
+                let Some(buffer) = host.default_buffer(bytes[1]) else {
                     return false;
                 };
                 crate::host::name(&buffer, || {
@@ -201,14 +279,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     width = of_from.Width,
                     height = of_from.Height,
                     parts,
+                    dropped,
                     written_as = of_from.Format.0,
                     read_as = of_to.Format.0,
                     "a view placed in the memory of a texture the host writes, in another format: read from that texture by a copy on the host"
                 );
-                let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
                     buffer,
-                    parts: of_written.into_iter().zip(of_read).collect(),
+                    parts: paired,
                 });
                 map.insert(placed as usize, through.clone());
                 through
@@ -236,12 +314,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         return true;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
-    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+    let part = |texture: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: index as u32,
+            SubresourceIndex: sub,
         },
     };
     let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -264,15 +342,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     unsafe {
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
-        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+        for p in &through.parts {
             list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+                .CopyTextureRegion(&rows(&p.written), 0, 0, 0, &part(from, p.from_sub), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
-        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+        for p in &through.parts {
             list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+                .CopyTextureRegion(&part(to, p.to_sub), 0, 0, 0, &rows(&p.read), None);
         }
         list.list
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
@@ -301,8 +379,12 @@ pub(crate) fn forget(resource: usize) {
             set.remove(&resource);
         }
     }
-    if let Some(staging) = staging {
-        crate::host::retire(staging);
+    note_resident(resource as This, None);
+    if let Some(stagings) = staging {
+        for staging in stagings {
+            let born = staging.born_seq;
+            crate::host::retire_born(staging, born);
+        }
     }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
@@ -424,6 +506,8 @@ impl Staging {
             }
             last.asked = now;
             last.hash = None;
+            // Write-watched pools are mapped for the whole texture.
+            note_resident(self.resource, None);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
@@ -442,11 +526,17 @@ impl Staging {
             let first =
                 (self.first..end).find(|&mip| self.layout.bytes_from(mip) <= resident as u64);
             let bytes = first.map_or(0, |mip| self.layout.bytes_from(mip) as usize);
+            // Host SRVs of this texture are narrowed to the same suffix.
+            let window = first.map(|mip| (mip, end - mip));
+            note_resident(self.resource, window);
             with_tiled_copy(self.memory, bytes, |tiled| {
                 self.changed(last, tiled, first.unwrap_or(end));
             });
             return bytes;
         }
+        // All of it is there (or the layout has no separable mip suffix):
+        // host views keep the title's full mip window.
+        note_resident(self.resource, None);
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
@@ -511,10 +601,14 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            if let Err(e) = self.layout.detile(
+                tiled,
+                mip + self.skipped,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+            ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
@@ -558,6 +652,48 @@ fn committed_prefix(at: *const u8, len: usize) -> usize {
     }
     p.min(end) - at as usize
 }
+
+/// Narrows a title view's mip window to the resident ones; see
+/// [`victory_formats::texture::narrowed_view`].
+pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u32, u32) {
+    victory_formats::texture::narrowed_view(asked, resident, mips)
+}
+
+/// Last-known resident mip window of a title texture, set by its staging
+/// refresh. `None` while it is fully mapped (or never partly streamed).
+pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
+    let map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(resource as usize)).copied()
+}
+
+/// Notes the resident mip window of `resource` (`None` when fully mapped).
+/// Host SRVs are narrowed to it while it stands and remade when it widens.
+pub(crate) fn note_resident(resource: This, window: Option<(u32, u32)>) {
+    let mut map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    match window {
+        Some(w) => {
+            map.insert(resource as usize, w);
+        }
+        None => {
+            map.remove(&(resource as usize));
+        }
+    }
+}
+
+/// Live resident mip window of `resource` from its mapped prefix, for the
+/// first host view before a staging refresh has noted one. `None` when fully
+/// mapped or the layout cannot express a mip suffix.
+pub(crate) fn live_resident(resource: This) -> Option<(u32, u32)> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let layout = crate::resource::texture_layout(&desc)?.planes[0]
+        .layout
+        .clone();
+    let committed = committed_prefix(memory, layout.size as usize);
+    layout.resident_from_prefix(committed)
+}
+
+static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<Arc<Staging>> {
@@ -634,8 +770,11 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        skipped: crate::resource::dropped_mips(resource),
         memory,
+        resource,
         last: Mutex::default(),
+        born_seq: crate::host::birth_seq(),
     });
     map.entry(resource as usize).or_default().push(s.clone());
     Some(s)
@@ -953,9 +1092,39 @@ mod tests {
             return;
         };
         let (tex, host_tex) = test_texture(4, 1, 1, None);
+        let weak = {
+            let s = staging(tex, host_tex, 0).expect("staging");
+            Arc::downgrade(&s)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
         let list = host.new_list().expect("host list");
         list.mark_work();
 
+        forget(tex as usize);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "forgotten texture staging must wait for active epochs that recorded after its birth"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(weak.strong_count(), 0);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn forget_drops_new_staging_despite_older_pinned_list() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        let (tex, host_tex) = test_texture(4, 1, 1, None);
         let weak = {
             let s = staging(tex, host_tex, 0).expect("staging");
             Arc::downgrade(&s)
@@ -965,15 +1134,23 @@ mod tests {
         forget(tex as usize);
         assert_eq!(
             weak.strong_count(),
-            1,
-            "forgotten texture staging must wait for active epochs"
+            0,
+            "staging created after stale list's last work must not leak behind it"
         );
-
-        list.close();
-        list.reset();
-        assert_eq!(weak.strong_count(), 0);
+        stale.close();
+        stale.reset();
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
         assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn alias_from_sub_skips_dropped_top_mips_per_layer() {
+        // Source has 5 mips; dest dropped 2 → dest mip 0 is source mip 2.
+        assert_eq!(alias_from_sub(0, 0, 2, 5), 2);
+        assert_eq!(alias_from_sub(2, 0, 2, 5), 4);
+        // Second array slice starts after the source's full chain.
+        assert_eq!(alias_from_sub(0, 1, 2, 5), 7);
+        assert_eq!(alias_from_sub(1, 1, 0, 3), 4);
     }
 
     /// A synthetic version of a title that packs light into an integer
@@ -1290,5 +1467,33 @@ void read(uint3 id : SV_DispatchThreadID) {
             std::array::from_fn(|i| 0x3F00_0000 | ((i as u32 + 1) * 0x1357));
         assert_eq!(got, expected);
         list.reset();
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::{forget, host_written, is_host_written, note_resident, resident};
+
+    #[test]
+    fn noted_resident_window_updates_when_more_arrive() {
+        let resource = 0x616u64 as _;
+        note_resident(resource, Some((5, 4)));
+        assert_eq!(resident(resource), Some((5, 4)));
+        note_resident(resource, Some((2, 7)));
+        assert_eq!(resident(resource), Some((2, 7)));
+        note_resident(resource, None);
+        assert_eq!(resident(resource), None);
+    }
+
+    #[test]
+    fn host_written_clears_resident_window() {
+        let resource = 0x617u64 as _;
+        note_resident(resource, Some((3, 5)));
+        assert_eq!(resident(resource), Some((3, 5)));
+        host_written(resource);
+        assert!(is_host_written(resource));
+        assert_eq!(resident(resource), None);
+        // Leave no cross-test residue in the process-wide sets.
+        forget(resource as usize);
     }
 }
