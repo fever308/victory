@@ -219,7 +219,9 @@ pub(crate) fn segments(this: This) -> Vec<Segment> {
     let segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = segments.clone();
     if let Some(current) = host.as_ref()
-        && (list.has_work.load(std::sync::atomic::Ordering::Acquire) || out.is_empty())
+        && (list.has_work.load(std::sync::atomic::Ordering::Acquire)
+            || current.has_epoch()
+            || out.is_empty())
     {
         out.push(Segment::List(current.clone()));
     }
@@ -502,7 +504,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                // A depth texture's unordered access is its colour twin's
+                // (the host gives the depth texture none): the barrier is
+                // on the texture shaders write.
+                match crate::resource::twin_resource(b.first) {
+                    Some(twin) => twin.as_raw().cast_const().cast(),
+                    None => host(b.first)?,
+                }
             },
             ..*b
         }),
@@ -602,6 +610,25 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether a title texture's host copy lacks its top mip levels (host
+/// memory pressure). Title copies index the title's subresources and name
+/// its sizes, so they are not replayed on such a copy: its contents come
+/// from title memory instead.
+// shortcut: a copy into or out of a mip-dropped texture is skipped, so
+// what the title only ever wrote there by copy stays as detiled from its
+// memory.
+#[cfg(windows)]
+fn mip_dropped(texture: This) -> bool {
+    let dropped = crate::resource::dropped_mips(texture) > 0;
+    if dropped {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!("copy skipped: a host texture lost mips to memory pressure");
+        });
+    }
+    dropped
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -633,9 +660,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if mip_dropped(dst) || mip_dropped(src) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(dst, false, true);
+            list.twin_use(src, false, false);
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -709,6 +742,9 @@ extern "system" fn copy_texture_region(
             ) else {
                 return;
             };
+            if mip_dropped(src.resource) {
+                return;
+            }
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
                 return;
             };
@@ -757,6 +793,8 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(src.resource, false, false);
             crate::texture::upload(&list, src.resource, from_tex);
             ensure_state(&list, src.resource, COPY_SOURCE);
             list.mark_work();
@@ -809,6 +847,9 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        if mip_dropped(dst.resource) || (src.kind != FOOTPRINT && mip_dropped(src.resource)) {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -844,9 +885,11 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
+            list.twin_use(src.resource, false, false);
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
+        list.twin_use(dst.resource, false, true);
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         list.mark_work();
@@ -921,6 +964,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if mip_dropped(dst) || mip_dropped(src) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,
@@ -929,6 +975,8 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        list.twin_use(dst, false, true);
+        list.twin_use(src, false, false);
         ensure_state(&list, dst, RESOLVE_DEST);
         ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1217,6 +1265,8 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        // A clear is a write; a partial one keeps what the twin held.
+        list.twin_use(record.resource, false, true);
         list.mark_work();
         ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
@@ -2988,6 +3038,14 @@ mod tests {
         state::blend_factor(list, &blend);
         state::stencil_ref(list, 0);
         set_pipeline(list, null);
+        // Empty OMSetRenderTargets (0 targets, null depth) must not pin an epoch.
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+            list,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
         let (c_idle, d_idle) = crate::host::DropCounter::new();
         crate::host::retire(c_idle);
         assert_eq!(

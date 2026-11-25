@@ -7,11 +7,17 @@
 //! leaves room for whatever stride a title assumes.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+
+/// Next creation id for [`Heap::id`]. `0` is reserved for "no heap";
+/// the renderer root-view heap key uses `u64::MAX`.
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The first index of `n` (non-zero) consecutive free slots in `taken`,
 /// searching from `cursor` on and then from the start. A run may cross the
@@ -75,6 +81,9 @@ struct Placement {
 pub(crate) struct Heap {
     object: Object,
     desc: HeapDesc,
+    /// Monotonic creation id; distinguishes a new heap that reused a
+    /// released heap's address (ABA-safe bind checks in `draw::State`).
+    id: u64,
     /// The first descriptor: in `memory`, or in the title's own memory.
     pub(crate) start: u64,
     memory: Option<Memory>,
@@ -261,6 +270,28 @@ fn mirror(handle: u64) {
 /// A host-only key, distinct from any aligned title heap pointer and from no heap.
 #[cfg(windows)]
 pub(crate) const ROOT_VIEW_HEAP: usize = usize::MAX;
+
+/// Identity of a bound heap key for ABA-safe comparison against prior binds.
+/// `0` = no heap; `u64::MAX` = renderer root-view heap; otherwise the title
+/// heap's creation id while it remains registered as shader-visible.
+/// A released (or never shader-visible) title key returns `0` so a later
+/// heap at the same address cannot match a remembered id.
+#[cfg(windows)]
+pub(crate) fn heap_bind_id(key: usize) -> u64 {
+    match key {
+        0 => 0,
+        ROOT_VIEW_HEAP => u64::MAX,
+        _ => {
+            let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+            heaps
+                .iter()
+                .find(|&&(_, _, h)| h == key)
+                // SAFETY: registered heaps are live (removed in `Drop`).
+                .map(|&(_, _, h)| unsafe { &*(h as *const Heap) }.id)
+                .unwrap_or(0)
+        }
+    }
+}
 
 /// Resolve one of the recording's bound heap keys. The renderer supplies a
 /// small view heap for bounded root descriptors if the title supplied none.
@@ -644,10 +675,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
-/// Device method.
+/// Device method: always records a CBV; a null desc is location 0, size 0.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    let [lo, hi, size, _] = words(desc).unwrap_or_default();
-    let address = u64::from(lo) | u64::from(hi) << 32;
+    let (address, size) = words(desc).map_or((0, 0), |[lo, hi, size, _]| {
+        (u64::from(lo) | u64::from(hi) << 32, size)
+    });
     record(handle, View::Constant(address, size));
 }
 
@@ -849,6 +881,7 @@ pub(crate) extern "system" fn create_heap(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        id: NEXT_HEAP_ID.fetch_add(1, Ordering::Relaxed),
         start,
         memory,
         #[cfg(windows)]
@@ -937,12 +970,19 @@ mod tests {
 
     #[test]
     fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let this = std::ptr::null();
         let mut slot = [0u64; 4];
         let handle = slot.as_mut_ptr() as u64;
-        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        create_cbv(this, &[0x1000, 0, 256, 0], handle);
         assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
 
-        create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        create_cbv(this, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+
+        // Same null-desc write clears a prior SRV, not only a prior CBV.
+        create_srv(this, this, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Shader(0, None)));
+        create_cbv(this, std::ptr::null(), handle);
         assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
@@ -1176,5 +1216,95 @@ mod tests {
         );
         assert!(get_desc(h, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    /// Creation ids are unique across heaps, including after a release that
+    /// may return the same allocation address to a later create (ABA).
+    #[test]
+    fn heap_creation_ids_are_unique_across_release() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut first = std::ptr::null();
+        assert_eq!(create(desc, none, &mut first), S_OK);
+        let first_id = heap(first).id;
+        assert_ne!(first_id, 0);
+
+        let mut second = std::ptr::null();
+        assert_eq!(create(desc, none, &mut second), S_OK);
+        let second_id = heap(second).id;
+        assert_ne!(second_id, first_id);
+
+        // Drop the first heap, then create another; the new id must not match
+        // either prior id even if the allocator reuses `first`'s address.
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(first, 0x10)(first),
+            0
+        );
+        let mut recycled = std::ptr::null();
+        assert_eq!(create(desc, none, &mut recycled), S_OK);
+        assert_ne!(heap(recycled).id, first_id);
+        assert_ne!(heap(recycled).id, second_id);
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(second, 0x10)(second),
+            0
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(recycled, 0x10)(recycled),
+            0
+        );
+    }
+
+    /// `heap_bind_id` tracks live shader-visible heaps by creation id, not
+    /// address, so a recycled pointer cannot match a remembered bind.
+    #[cfg(windows)]
+    #[test]
+    fn heap_bind_id_rejects_address_reuse_after_release() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1, // shader-visible
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut first = std::ptr::null();
+        assert_eq!(create(desc, none, &mut first), S_OK);
+        let key = first as usize;
+        let remembered = heap_bind_id(key);
+        assert_eq!(remembered, heap(first).id);
+        assert_ne!(remembered, 0);
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(first, 0x10)(first),
+            0
+        );
+        assert_eq!(heap_bind_id(key), 0, "released heap is no longer bound");
+
+        let mut recycled = std::ptr::null();
+        assert_eq!(create(desc, none, &mut recycled), S_OK);
+        let recycled_key = recycled as usize;
+        let new_id = heap_bind_id(recycled_key);
+        assert_eq!(new_id, heap(recycled).id);
+        assert_ne!(new_id, remembered, "ABA: same address must not keep old id");
+        if recycled_key == key {
+            assert_ne!(new_id, remembered);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(recycled, 0x10)(recycled),
+            0
+        );
+        assert_eq!(heap_bind_id(0), 0);
+        assert_eq!(heap_bind_id(ROOT_VIEW_HEAP), u64::MAX);
     }
 }

@@ -40,6 +40,24 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of title memory at an address no root parameter
+/// gives: one the code computes from root constants, reads out of a
+/// descriptor or loads from other memory (compute programs only: the
+/// ray-tracing structure builder and the programs that walk its
+/// structures). Offset and computed term are not used: lowering takes the
+/// 64-bit address from the instruction's operands.
+pub const MEMORY: usize = usize::MAX - 1;
+
+/// The reasons an address traces to no root parameter for which the
+/// address is then taken as it stands ([`MEMORY`]).
+const RAW: [&str; 5] = [
+    "an address not from a root parameter",
+    "an address from a root parameter that is no address",
+    "an address in an SGPR that is no root parameter",
+    "an address loaded from memory",
+    "an address from a phi",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -123,6 +141,25 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
+    /// its nodes are.
+    pub bvh: Vec<(Site, BvhNodes)>,
+}
+
+/// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
+/// descriptor operand names a range of memory, not a texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BvhNodes {
+    /// A buffer of the host: the descriptor is loaded from a table (it is
+    /// among [`Resources::descriptors`]), and node pointers count from the
+    /// buffer's start. Its flags are not known to the shader: boxes are
+    /// sorted and triangles return barycentrics, as every descriptor
+    /// the title builds asks.
+    Resource,
+    /// Title memory by address: the code makes the descriptor from numbers
+    /// (the title: the whole address space, or one structure's address in
+    /// dword 0). Dwords 1 and 3, which hold its flags.
+    Memory { word1: u32, word3: u32 },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -203,6 +240,7 @@ pub fn track(
                 } if !inst.name().starts_with("s_buffer_")
                     && (inst.name().contains("_load_") || inst.name().contains("_store_")) =>
                 {
+                    t.clamped.set(false);
                     let address = match t.smem_address(inst, base, *offset, soffset) {
                         Ok(a) => a,
                         Err("an address read from the first lane of a per-lane value") => {
@@ -214,7 +252,7 @@ pub fn track(
                             pending_waterfall_loads.insert(site, reads);
                             a
                         }
-                        Err(what) => return Err(fail(what)),
+                        Err(what) => t.by_address(what).map_err(fail)?,
                     };
                     out.scalar.push((site, address));
                 }
@@ -224,8 +262,10 @@ pub fn track(
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
+                    t.clamped.set(false);
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .or_else(|why| t.by_address(why))
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -264,10 +304,46 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
-                // A ray query is lowered as a miss and never reads its BVH
-                // descriptor, which the shader typically builds from a base
-                // address in a loop; there is nothing to trace.
-                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
+                Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
+                    // The ray and node test names no texture. A descriptor
+                    // whose flag dwords the code sets as numbers and whose
+                    // type is a ray-tracing structure is a range of title
+                    // memory (the title: all of it, or from one structure's
+                    // address on), and the node's address is among the
+                    // operands; any other descriptor that can be traced is a
+                    // resource of the host. One that cannot be traced is not
+                    // an error: the query then lowers as a miss, which never
+                    // reads its descriptor.
+                    let word = |k: u8| match *rsrc {
+                        Operand::Scalar { code, dwords } if k < dwords => {
+                            inst.read(Reg::S(code + k)).map(|v| t.origin(v))
+                        }
+                        _ => None,
+                    };
+                    match (word(1), word(3)) {
+                        (Some(Term::Const(word1)), Some(Term::Const(word3)))
+                            if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
+                        {
+                            out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                        }
+                        _ => {
+                            if descriptor(rsrc, Role::Resource).is_ok() {
+                                // A descriptor fixed in the code names no
+                                // memory to walk, so the query is left to
+                                // lower as a miss.
+                                let usable = out
+                                    .descriptors
+                                    .iter()
+                                    .rev()
+                                    .find(|d| d.site == site && d.role == Role::Resource)
+                                    .is_some_and(|d| !matches!(d.source, Source::Constant(_)));
+                                if usable {
+                                    out.bvh.push((site, BvhNodes::Resource));
+                                }
+                            }
+                        }
+                    }
+                }
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -457,6 +533,10 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// Memo of [`Tracer::uniform`] per value.
     uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
+    /// A clamped VALU addition was met while tracing the current address:
+    /// its result saturates, so the sum must not be folded (and a non-root
+    /// address is not taken as title memory either).
+    clamped: std::cell::Cell<bool>,
 }
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -515,6 +595,8 @@ const UNIFORM_VALU: &[&str] = &[
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
 
+/// The user-data dword a pixel program's heap base address starts at.
+const HEAP_BASE_DWORD: u8 = 2;
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
 const MAX_MEET: usize = 1 << 16;
@@ -573,6 +655,7 @@ impl<'a> Tracer<'a> {
             lanes,
             rpo,
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
+            clamped: std::cell::Cell::new(false),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -659,11 +742,48 @@ impl<'a> Tracer<'a> {
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
-        self.layout.iter().enumerate().find_map(|(i, p)| {
-            let first = self.stage.user_sgpr(p.user_data);
-            let dword = u32::from(code).checked_sub(first.into())?;
-            (dword < p.sgprs).then_some((i, dword))
-        })
+        self.layout
+            .iter()
+            .enumerate()
+            .find_map(|(i, p)| {
+                let first = self.stage.user_sgpr(p.user_data);
+                let dword = u32::from(code).checked_sub(first.into())?;
+                (dword < p.sgprs).then_some((i, dword))
+            })
+            .or_else(|| {
+                let (param, base) = self.heap_base()?;
+                let dword = u32::from(code).checked_sub(base.into())?;
+                (dword < 2).then_some((param, dword))
+            })
+    }
+
+    /// A pixel program's heap base address: a 64-bit address in user-data
+    /// dwords 2 and 3 (the SGPR of the first, here), though the layout states
+    /// the heap parameter as one dword. It belongs to the program's heap
+    /// parameter, which must be the only kind there is (a resource heap or a
+    /// sampler heap, not both) and may not share either SGPR with another
+    /// parameter.
+    fn heap_base(&self) -> Option<(usize, u8)> {
+        if self.stage != HwStage::Ps {
+            return None;
+        }
+        let low = self.stage.user_sgpr(HEAP_BASE_DWORD);
+        let heap = |p: &RootParam| matches!(p.root, RootType::ResourceHeap | RootType::SamplerHeap);
+        let (param, first) = self.layout.iter().enumerate().find(|(_, p)| heap(p))?;
+        if self.layout.iter().any(|p| p.root != first.root && heap(p)) {
+            return None;
+        }
+        let shares = self.layout.iter().any(|p| {
+            let at = u32::from(self.stage.user_sgpr(p.user_data));
+            let span = if p.root == RootType::Descriptor {
+                p.sgprs.max(2)
+            } else {
+                p.sgprs
+            };
+            let covers = |s: u32| at <= s && s < at + span;
+            !heap(p) && (covers(low.into()) || covers(u32::from(low) + 1))
+        });
+        (!shares).then_some((param, low))
     }
 
     /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
@@ -959,6 +1079,10 @@ impl<'a> Tracer<'a> {
         if inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -992,6 +1116,10 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1036,6 +1164,10 @@ impl<'a> Tracer<'a> {
             || inst.write(Reg::V(reg)) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1070,6 +1202,10 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp && {
+                self.clamped.set(true);
+                true
+            }
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -1187,9 +1323,21 @@ impl<'a> Tracer<'a> {
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
         let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
-            && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
-        {
+        // A heap base address in user-data dwords 2 and 3 has the second as
+        // its high half (the program may also have zeroed it instead).
+        let pair_high = match (self.heap_base(), reg) {
+            (Some((p, low)), Reg::S(c)) if p == param && c == low => self
+                .p
+                .inputs
+                .iter()
+                .find(|i| i.0 == Reg::S(low + 1))
+                .map(|i| i.1),
+            _ => None,
+        };
+        let high_ok = |h: Option<Value>| {
+            self.high_half(hi, h) || (dynamic.is_some() && h.is_some_and(|h| self.carried(hi, h)))
+        };
+        if !high_ok(high) && !pair_high.is_some_and(|h| high_ok(Some(h))) {
             return Err("an address with an untracked high half");
         }
         Ok(Address {
@@ -1200,6 +1348,24 @@ impl<'a> Tracer<'a> {
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry, through joins.
+    /// The address of an access that traces to no root parameter (`why`
+    /// says how it failed): title memory at the address as it stands, in a
+    /// compute program.
+    fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
+        if self.clamped.get() {
+            return Err(why);
+        }
+        if self.stage == HwStage::Cs && RAW.contains(&why) {
+            Ok(Address {
+                param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            })
+        } else {
+            Err(why)
+        }
+    }
+
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         self.high_half_in(hi, high, &mut Vec::new())
     }
@@ -3304,6 +3470,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// A pixel program's heap base address is the 64-bit pair in user-data
+    /// dwords 2 and 3, whichever dword the layout gives the heap parameter.
+    fn heap_pair_words(high: &[u32]) -> Vec<u32> {
+        let mut words = vec![0x8F08_8506]; // s_lshl_b32 s8, s6, 5
+        words.extend_from_slice(high);
+        words.extend_from_slice(&[
+            0xF408_0201,
+            0x1000_0000, // s_load_dwordx4 s[8:11], s[2:3], s8
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    #[test]
+    fn a_pixel_heap_base_pair_belongs_to_the_heap_parameter() {
+        let layout = [param(Constants, 6, 1), param(ResourceHeap, 10, 1)];
+        for high in [&[][..], &[0xBE83_0380][..]] {
+            // The high half is the input s3, or zero (s_mov_b32 s3, 0).
+            let r = track_words(&heap_pair_words(high), &layout, HwStage::Ps);
+            assert_eq!(r.scalar[0].1.param, 1);
+            assert_eq!(
+                r.descriptors[0].source,
+                Source::Loaded {
+                    load: (0, 1 + high.len()),
+                    first: 0
+                }
+            );
+            let held = |dword| r.params.iter().any(|p| (p.1, p.2) == (1, dword));
+            assert!(held(0));
+            assert_eq!(held(1), high.is_empty());
+        }
+        // The same heap parameter stated at user-data dword 2.
+        let layout = [param(Constants, 6, 1), param(ResourceHeap, 2, 1)];
+        let r = track_words(&heap_pair_words(&[]), &layout, HwStage::Ps);
+        assert_eq!(r.scalar[0].1.param, 1);
+    }
+
+    #[test]
+    fn a_heap_base_pair_is_for_pixel_programs_only() {
+        let layout = [param(Constants, 6, 1), param(ResourceHeap, 10, 1)];
+        let code: Vec<u8> = heap_pair_words(&[])
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        assert_eq!(t.param_of(Reg::S(2)), None);
+        assert_eq!(t.param_of(Reg::S(3)), None);
+        let t = Tracer::new(&p, &layout, HwStage::Ps, None).unwrap();
+        assert_eq!(t.param_of(Reg::S(2)), Some((1, 0)));
+        assert_eq!(t.param_of(Reg::S(3)), Some((1, 1)));
+        // Not when another parameter holds one of the SGPRs, or both kinds
+        // of heap are there (whose base the pair is would be a guess).
+        for layout in [
+            &[param(Constants, 3, 1), param(ResourceHeap, 10, 1)][..],
+            &[param(SamplerHeap, 11, 1), param(ResourceHeap, 10, 1)][..],
+        ] {
+            let t = Tracer::new(&p, layout, HwStage::Ps, None).unwrap();
+            assert_eq!(t.param_of(Reg::S(2)), None);
+        }
+    }
+
     #[test]
     fn spilled_sgprs_are_followed_through_vgpr_lanes() {
         let r = track_words(
@@ -3487,6 +3717,27 @@ pub(crate) mod tests {
         // s_getpc_b64 is the first instruction: its next one is at 4.
         assert_eq!(a.offset, 4 + 0xDDC);
         assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    /// VOP3 integer `clamp` saturates; address analysis must not treat the
+    /// sum as wrapping or it would fold `getpc` constants that a saturated
+    /// add never produces (VIC-BT-010 / resource side of #675).
+    #[test]
+    fn clamped_vector_add_is_not_wrapping_address_math() {
+        let mut words = CODE_TABLE_FIRST_LANE.to_vec();
+        let lo = words.iter().position(|&w| w == 0xD70F_6A01).unwrap();
+        words[lo] |= 1 << 15; // clamp on v_add_co_u32
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 48,
+                what: "an address not from a root parameter"
+            },
+            "{err:?}"
+        );
     }
 
     /// [`CODE_TABLE_FIRST_LANE`] with the low dword's add taking a carry-in

@@ -11,6 +11,7 @@
 // collide at link time.
 #[cfg(test)]
 pub mod agility;
+pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;

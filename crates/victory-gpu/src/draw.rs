@@ -140,7 +140,9 @@ struct FreshTableEntry {
     dead_slots: Vec<u32>,
 }
 
-/// Fast-path and incremental-sync cache for [`State::bindless_textures`].
+/// Fast-path and incremental-sync cache for the texture half of
+/// [`State::bindless_textures`]. Buffer refreshes always run when a stage
+/// indexes `ResourceHeap` and are not gated by this cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BindlessCache {
     heap: usize,
@@ -189,6 +191,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// [`descriptor::heap_bind_id`] for each of [`Self::host_heaps`] when
+    /// last bound; catches a new heap reused at the same title address.
+    host_heap_ids: [u64; 2],
     /// Tables made afresh in this list, keyed by title heap, `list.copy_gen()`,
     /// slot count, and hashed descriptor records. Partitioning by `copy_gen`
     /// preserves `Fill -> Copy -> Fill` ordering for CBV snapshots across
@@ -367,6 +372,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_heap_ids = [0; 2];
         if self.topology != 0 {
             self.set_topology(new_list, self.topology);
         }
@@ -461,7 +467,6 @@ impl State {
         if crate::host::host().is_none() {
             return;
         }
-        list.mark_work();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -694,6 +699,10 @@ impl State {
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
+        if let Some(depth) = self.depth {
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(depth.resource as This, false, true);
+        }
         self.ensure_depth_state(list);
         true
     }
@@ -714,6 +723,37 @@ impl State {
         self.depth
             .filter(|depth| !compute && depth.state == DEPTH_READ)
             .map(|depth| depth.resource)
+    }
+
+    /// A user-data dword the host computes for a translated shader
+    /// (`victory_shader::emit::USER_MEMORY_BASE`).
+    fn host_word(&self, kind: u32, memory: Option<&crate::memory::Ready>) -> u32 {
+        if kind == victory_shader::emit::USER_MEMORY_BASE {
+            return memory.map_or(0, |m| m.base);
+        }
+        once!(kind, "a shader reads a host value this build does not know");
+        0
+    }
+
+    /// For a shader that reads title memory by address
+    /// ([`crate::memory`]): its directory, fault notes and view slots,
+    /// with the pages of the root views the list has set made ready.
+    fn memory_ready(
+        &self,
+        list: &HostList,
+        compute: bool,
+        writes: bool,
+    ) -> Option<crate::memory::Ready> {
+        let heap = crate::descriptor::recording_heap(self.host_heaps[0])?;
+        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        for root in self.roots_ref(compute) {
+            match root {
+                Root::View(address) => addresses.push(*address),
+                Root::Constants(values) => constants.extend_from_slice(values),
+                _ => {}
+            }
+        }
+        crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
     /// A descriptor a shader reads through a table: its host slot made if
@@ -800,9 +840,29 @@ impl State {
                 }
                 return false;
             }
+            // Title memory by address: what the shader finds it by.
+            let memory = if t
+                .host
+                .root_srvs
+                .contains(&victory_shader::emit::SLOT_MEMORY)
+            {
+                let Some(ready) = self.memory_ready(list, compute, false) else {
+                    once!(
+                        "a shader that reads title memory by address without a view heap to hold its views: the draw is dropped"
+                    );
+                    return false;
+                };
+                Some(ready)
+            } else {
+                None
+            };
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
+                    if let RootType::Other(kind) = u.root {
+                        values[u.index as usize] = self.host_word(kind, memory.as_ref());
+                        continue;
+                    }
                     if u.indexed_buffer {
                         let selected =
                             self.user_value(compute, u.slot, RootType::Constants, u.dword);
@@ -832,6 +892,30 @@ impl State {
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
+                    if srv && slot == victory_shader::emit::SLOT_MEMORY {
+                        // Ours: the directory of title memory by address.
+                        if let Some(m) = &memory {
+                            // SAFETY: an open list; the directory and its heap slot live
+                            // as long as the process and the list holds both.
+                            unsafe {
+                                match (compute, tabled) {
+                                    (true, true) => {
+                                        l.SetComputeRootDescriptorTable(param, m.directory_table)
+                                    }
+                                    (false, true) => {
+                                        l.SetGraphicsRootDescriptorTable(param, m.directory_table)
+                                    }
+                                    (true, false) => {
+                                        l.SetComputeRootShaderResourceView(param, m.directory)
+                                    }
+                                    (false, false) => {
+                                        l.SetGraphicsRootShaderResourceView(param, m.directory)
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -870,6 +954,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_FAULTS {
+                    // Ours: where shaders note the pages they found empty.
+                    if let Some(m) = &memory {
+                        // SAFETY: an open list; the buffer and its heap slot live as long
+                        // as the process and the list holds both.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootDescriptorTable(param, m.faults_table);
+                            } else {
+                                l.SetGraphicsRootDescriptorTable(param, m.faults_table);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
@@ -882,6 +981,9 @@ impl State {
                 }
             }
         }
+        // Depth textures it writes through unordered access: their colour
+        // twins hold what they lack from here on.
+        list.twins_written();
         true
     }
 
@@ -892,11 +994,22 @@ impl State {
         if keys[0] == 0 && needs_root_heap {
             keys[0] = crate::descriptor::ROOT_VIEW_HEAP;
         }
-        if keys != self.host_heaps {
+        let ids = [
+            crate::descriptor::heap_bind_id(keys[0]),
+            crate::descriptor::heap_bind_id(keys[1]),
+        ];
+        // Compare creation ids as well as pointers: a released heap's
+        // address may be reused by a new heap (ABA), which still needs a
+        // fresh `SetDescriptorHeaps`.
+        if keys != self.host_heaps || ids != self.host_heap_ids {
             let mut heaps = Vec::new();
-            for key in keys {
+            for (key, id) in keys.into_iter().zip(ids) {
                 if key == 0 {
                     continue;
+                }
+                if key != crate::descriptor::ROOT_VIEW_HEAP && id == 0 {
+                    once!("a bound descriptor heap was released");
+                    return false;
                 }
                 let Some(heap) = crate::descriptor::recording_heap(key) else {
                     once!("a bound descriptor heap could not be created on the host");
@@ -908,6 +1021,7 @@ impl State {
             // SAFETY: an open list and shader-visible heaps retained for the recording.
             unsafe { list.list.SetDescriptorHeaps(&heaps) };
             self.host_heaps = keys;
+            self.host_heap_ids = ids;
             self.host_roots = [0; 2];
         }
         true
@@ -1061,14 +1175,17 @@ impl State {
         true
     }
 
-    /// Transitions (and uploads title-written) live bindless textures in the
-    /// bound CBV/SRV/UAV heap when any stage indexes `ResourceHeap`.
+    /// Refreshes bindless buffer views and transitions (and uploads
+    /// title-written) live bindless textures in the bound CBV/SRV/UAV heap
+    /// when any stage indexes `ResourceHeap`.
     fn bindless_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let mut uses_heap = false;
         let mut uses_heap_srv = false;
         let mut uses_heap_uav = false;
         for stage in &p.stages {
             for u in &stage.translated().used {
                 if u.root == RootType::ResourceHeap {
+                    uses_heap = true;
                     match u.kind {
                         ResourceType::Srv => uses_heap_srv = true,
                         ResourceType::Uav => uses_heap_uav = true,
@@ -1077,16 +1194,20 @@ impl State {
                 }
             }
         }
-        if (!uses_heap_srv && !uses_heap_uav) || self.heaps[0] == 0 {
+        if !uses_heap || self.heaps[0] == 0 {
             return;
         }
         let Some(host) = crate::descriptor::heap(self.heaps[0] as This).host() else {
             return;
         };
-        // Off-element aligned copies and other special buffer views are not
-        // textures; refresh them every ResourceHeap draw/dispatch so heap-
-        // indexed SRVs see title writes (#553).
-        host.refresh_special_buffers(list);
+        // Buffer / constant views through ResourceDescriptorHeap: title CPU
+        // writes do not bump tex_gen or state_gen, so refresh every time a
+        // stage indexes the heap — same cadence as table `readable()`.
+        // Also covers off-element / aliased slots (#553).
+        host.refresh_bindless_buffers(list);
+        if !uses_heap_srv && !uses_heap_uav {
+            return;
+        }
         let targets_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2343,6 +2464,8 @@ fn readable(
             {
                 crate::texture::upload_from(list, *resource as This, t, first_mip);
             }
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(*resource as This, false, false);
             // Keep the same read bits the depth target will request at draw time.
             let samples_depth = read_only_depth == Some(*resource);
             let state = if samples_depth {
@@ -2366,9 +2489,22 @@ fn readable(
             samples_depth
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            // A shader writes it, so its contents are on the host and not in
+            // title memory (as for a copy destination): the upload a later
+            // read brings textures the title fills up to date with would copy
+            // the old title memory over what the shader wrote.
+            if crate::resource::host_resource(*resource as This).is_some() {
+                crate::texture::host_written(*resource as This);
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
-            crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            // Unordered access to a depth texture is its colour twin's: the
+            // write does not land in the depth texture, so it is not the
+            // draw's depth target and is not marked as sampled.
+            let twinned = list.twin_use(*resource as This, true, true);
+            if !twinned {
+                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            }
             false
         }
         _ => false,
@@ -2515,7 +2651,12 @@ mod tests {
         let mut state = State::default();
         assert!(state.bind_heaps(&list, true));
         assert_eq!(state.host_heaps, [crate::descriptor::ROOT_VIEW_HEAP, 0]);
+        assert_eq!(state.host_heap_ids, [u64::MAX, 0]);
         assert_eq!(state.heaps, [0, 0]);
+        // Same title keys and creation ids must not re-bind.
+        let bound = (state.host_heaps, state.host_heap_ids);
+        assert!(state.bind_heaps(&list, true));
+        assert_eq!((state.host_heaps, state.host_heap_ids), bound);
         for ((root, pso), dst, src) in [(&first, src.0, None), (&second, dst.0, Some(src.0))] {
             // SAFETY: an open list and matching live root signature and pipeline.
             unsafe {
@@ -2931,6 +3072,7 @@ mod depth_tests {
         state.host_pipeline = 0x1234;
         state.host_roots = [0x11, 0x22];
         state.host_heaps = [0x33, 0x44];
+        state.host_heap_ids = [0x55, 0x66];
         state.fresh_tables.insert(
             FreshTableKey {
                 heap: 0xdead,
@@ -2956,6 +3098,7 @@ mod depth_tests {
         assert_eq!(state.host_pipeline, 0);
         assert_eq!(state.host_roots, [0; 2]);
         assert_eq!(state.host_heaps, [0; 2]);
+        assert_eq!(state.host_heap_ids, [0; 2]);
         assert_eq!(state.topology, 4);
         assert_eq!(state.viewports.len(), 1);
         assert_eq!(state.viewports[0].Width, 64.0);

@@ -4,7 +4,10 @@
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
 //! writes it (view creation and descriptor copies), when a heap is synced for
 //! direct CPU copies inside heap memory, and again when a draw reads it
-//! through a table and finds the slot changed.
+//! through a table and finds the slot changed. Draws that index
+//! `ResourceDescriptorHeap` also refresh the live buffer ranges tracked here
+//! ([`HostHeap::refresh_bindless_buffers`]) so heap-indexed views stay as
+//! current as table ones.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -36,6 +39,20 @@ type SrvMips = (usize, (u32, u32));
 /// [`TexTracker::changes`] for incremental bindless sync across `tex_gen`
 /// bumps; overflowing falls back to a full `live_textures` walk once.
 const MAX_TEX_CHANGES: usize = 4096;
+
+/// Live title-memory buffer range a heap slot views, for bindless refresh.
+/// The bool is whether the view is unordered (refresh must leave the host
+/// copy in unordered-access state, not generic-read).
+type BufRange = (Arc<Shadow>, u64, u64, bool);
+
+/// Tracks which title slots hold buffer / constant views whose host copies
+/// need a submission-time refresh when a shader indexes `ResourceDescriptorHeap`.
+/// Unaligned and aliased structured slots stay in [`HostHeap::refreshes`] instead.
+#[derive(Default)]
+struct BufTracker {
+    /// Title slot → host copy range. Dynamic slots are never recorded.
+    live: HashMap<u32, BufRange>,
+}
 
 /// Tracks which live host textures each view-heap slot currently references,
 /// keeping `O(active)` live sets of SRV and UAV resources for bindless heaps.
@@ -163,6 +180,8 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
+    /// Title slots holding buffer / constant views for bindless refresh.
+    buf_tracker: Mutex<BufTracker>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -355,6 +374,7 @@ impl HostHeap {
             srv_mips: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
+            buf_tracker: Mutex::new(BufTracker::default()),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -552,6 +572,7 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, Kept::Empty);
+        self.track_buffer(index, None);
     }
 
     /// Slot `index` now views `kept` (or nothing of the host's).
@@ -634,19 +655,6 @@ impl HostHeap {
                 true
             }
             None => false,
-        }
-    }
-
-    /// Refreshes every off-element / aliased buffer view this heap holds.
-    /// Table paths call [`Self::refresh_slot`] per entry; ResourceHeap draws
-    /// never walk those tables, so bindless must refresh them here (#553).
-    pub(crate) fn refresh_special_buffers(&self, list: &HostList) {
-        let special: Vec<u32> = {
-            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
-            map.keys().copied().filter(|&i| i < self.count).collect()
-        };
-        for index in special {
-            let _ = self.refresh_slot(index, list);
         }
     }
 
@@ -790,6 +798,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.track_slot(index, None);
+                self.track_buffer(index, None);
             }
             return None;
         };
@@ -817,17 +826,26 @@ impl HostHeap {
                 }
                 _ => None,
             };
+            // Ordinary buffer / constant copies are not in `refreshes` (only
+            // unaligned and aliased structured slots are); record them so
+            // bindless draws can refresh the ranges they index.
+            let buf = match &kept {
+                Some(Kept::Resource(_)) => buffer_refresh_range(&view),
+                _ => None,
+            };
             if !made_ok && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.unwrap_or(Kept::Empty));
             self.track_slot(index, new_entry);
+            self.track_buffer(index, buf);
             // Close the race with `descriptor::forget` running between the initial
             // `view_at` lookup and `track_slot` before this heap's publication.
             if new_entry.is_some() && view_at(i, generation).is_none() {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.track_slot(index, None);
+                self.track_buffer(index, None);
                 return None;
             }
         }
@@ -933,6 +951,66 @@ impl HostHeap {
         if let Some((res, _, _)) = new_entry {
             tracker.record_change(res);
         }
+    }
+
+    /// Updates the live buffer-range tracker for title slot `index`.
+    fn track_buffer(&self, index: u32, range: Option<BufRange>) {
+        if self.sampler || index >= self.count {
+            return;
+        }
+        let mut tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        match range {
+            Some(range) => {
+                tracker.live.insert(index, range);
+            }
+            None => {
+                tracker.live.remove(&index);
+            }
+        }
+    }
+
+    /// Brings title-memory buffer ranges viewed by this heap's title slots up
+    /// to date for a draw or dispatch that indexes `ResourceDescriptorHeap`.
+    ///
+    /// Covers ordinary buffer / constant copies tracked in [`BufTracker`], and
+    /// unaligned / aliased structured slots registered in [`Self::refreshes`].
+    /// Unordered heap views refresh into unordered-access state so the
+    /// dispatch can write them; copy-back of heap-only UAV ranges is still
+    /// skipped (a full-heap snapshot is too expensive; table UAVs still go
+    /// through [`crate::draw`]'s `readable` path).
+    pub(crate) fn refresh_bindless_buffers(&self, list: &HostList) {
+        if self.sampler {
+            return;
+        }
+        let special: Vec<u32> = {
+            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+            map.keys().copied().filter(|&i| i < self.count).collect()
+        };
+        for index in special {
+            let _ = self.refresh_slot(index, list);
+        }
+        let live: Vec<BufRange> = {
+            let tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.live.values().cloned().collect()
+        };
+        for (shadow, address, len, is_uav) in live {
+            let access = if is_uav {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            };
+            shadow.refresh_as(list, address, len, access);
+        }
+    }
+
+    /// Live buffer ranges currently tracked for bindless refresh (tests).
+    #[cfg(test)]
+    pub(crate) fn live_buffer_count(&self) -> usize {
+        self.buf_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .len()
     }
 
     /// Removes all tracked references to `resource` when the title releases it,
@@ -1341,6 +1419,48 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// Host copy range a buffer or constant view reads, for bindless refresh.
+///
+/// Resolves the shadow the same way descriptor creation does (`find` on the
+/// buffer's full base and length), then refreshes only the viewed subrange —
+/// so overlapping title buffers do not pick a different innermost shadow than
+/// the one the descriptor was created against.
+fn buffer_refresh_range(view: &View) -> Option<BufRange> {
+    let is_uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let (base, extent) = buffer_host_extent(view)?;
+    if extent == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, extent)?;
+    let (address, len) = match *view {
+        View::Constant(address, size) => (address, u64::from(size)),
+        _ => buffer_range(view)?,
+    };
+    if len == 0 {
+        return None;
+    }
+    let len = len.min(shadow.left(address));
+    (len > 0).then_some((shadow, address, len, is_uav))
+}
+
+/// The full title buffer a view was created against: base address and length
+/// passed to [`crate::shadow::find`] when making the host descriptor.
+fn buffer_host_extent(view: &View) -> Option<(u64, u64)> {
+    match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        View::Shader(resource, Some(_)) | View::Unordered(resource, _, Some(_)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len))
+        }
+        View::Placed(_, resource, desc) if resource[0] == 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len))
+        }
+        _ => None,
     }
 }
 
@@ -1811,6 +1931,57 @@ fn concrete_format_for(
     Some(DXGI_FORMAT(concrete as i32))
 }
 
+/// Rebases a shader view of a title texture onto its host copy, which lacks
+/// the title's top `dropped` mip levels (see `resource::dropped_mips`): the
+/// level range and the minimum LOD clamp name the title's levels.
+fn drop_mips_in_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    let rebase = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        (*most, *levels) = crate::resource::rebase_mip_range(*most, *levels, dropped);
+        *clamp = (*clamp - dropped as f32).max(0.0);
+    };
+    // SAFETY: each arm reads the union member the view dimension selects.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Synthesizes a full SRV description matching `rd` with concrete `format` when
 /// the host texture is typeless and the title passed a null description.
 fn default_srv_desc(
@@ -1998,6 +2169,72 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// The unordered access view description for a title's view of a depth
+/// texture, made for the texture's colour twin `twin`
+/// ([`crate::resource::Twin`]): the same mip and slices, in the colour
+/// format of the twin's family for a typeless or depth view format.
+/// The twin of a stencil plane (R8) stands for the views of that plane
+/// only: those that name plane 1 or a stencil format. A view of the depth
+/// plane has a twin of its own, viewed as a depth texture's without
+/// stencil: a view of it that names plane 0 or a depth format takes the
+/// twin's colour format too.
+fn twin_uav(
+    twin: &ID3D12Resource,
+    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { twin.GetDesc() };
+    let mut desc = desc.cloned().unwrap_or_else(|| {
+        let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        if d.DepthOrArraySize > 1 {
+            all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: u32::from(d.DepthOrArraySize),
+                ..Default::default()
+            };
+        }
+        all
+    });
+    // A stencil plane's twin (R8 typeless, 60): the title's view is of the
+    // stencil plane if it names plane 1 or a stencil view format (22, 47).
+    if d.Format.0 == 60 {
+        let mut plane = 0;
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => {
+                // SAFETY: the member the dimension names.
+                let mut view = unsafe { desc.Anonymous.Texture2D };
+                plane = std::mem::take(&mut view.PlaneSlice);
+                desc.Anonymous.Texture2D = view;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                // SAFETY: the member the dimension names.
+                let mut view = unsafe { desc.Anonymous.Texture2DArray };
+                plane = std::mem::take(&mut view.PlaneSlice);
+                desc.Anonymous.Texture2DArray = view;
+            }
+            _ => {}
+        }
+        if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
+            return None;
+        }
+        desc.Format.0 = 62;
+        return Some(desc);
+    }
+    // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40),
+    // and those of a depth-stencil format's depth plane (19 to 21, 44 to
+    // 46), for the twin of such a plane: the twin's UNORM / float view
+    // formats (R16_UNORM 56, R32_FLOAT 41).
+    desc.Format.0 = match (desc.Format.0, d.Format.0) {
+        (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
+        (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
+        (other, _) => other,
+    };
+    Some(desc)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2045,6 +2282,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                if let Some(dsc) = desc.as_mut() {
+                    drop_mips_in_srv(dsc, crate::resource::dropped_mips(resource));
                 }
                 // A texture only part of which is mapped (streaming in):
                 // sample the mips that are there, not the zeros of the ones
@@ -2103,6 +2343,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
             }
+            // A depth texture's unordered access is its colour twin's: the
+            // host gives a depth texture none.
+            let twin = crate::resource::twin_resource(resource)
+                .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
+                // A view of the depth plane of a texture with a stencil
+                // plane: of that plane's own twin.
+                .or_else(|| {
+                    let twin = crate::resource::twin_plane_resource(resource)?;
+                    Some((twin, twin_uav(twin, desc.as_ref())?))
+                });
+            let texture = match twin {
+                Some((twin, view)) => {
+                    desc = Some(view);
+                    twin
+                }
+                None => texture,
+            };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
@@ -2145,12 +2402,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
+                // A texture the title placed itself with no host resource at
+                // its address stays unmirrored: null, as before.
                 once!(
                     dimension = resource[0],
-                    "placed unordered texture view not mirrored"
+                    unordered = *unordered,
+                    "placed texture view not mirrored"
                 );
                 return None;
             }
@@ -2181,19 +2438,24 @@ pub(crate) fn placed_first_mip(view: &View) -> u32 {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// Resolves a placed texture's SRV or UAV to the resource created at its
+/// address (the resource is made on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource)? as usize;
+    let desc = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture, 0, desc)
+    } else {
+        View::Shader(texture, desc)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -2219,6 +2481,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
+        // shortcut: the title's null SRV at heap slot 0 is one of these
+        // (resource 0 with a texture desc). Slot 0 is also read as a CBV
+        // through a computed heap index; a single host descriptor cannot be
+        // both an SRV and a CBV, so the translator skips heap-direct CBV
+        // loads at index 0 rather than asking for a null CBV here (#485).
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
@@ -2435,6 +2702,39 @@ mod tests {
             return;
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The title's null SRV at heap slot 0 is a texture view of no resource.
+    /// It must stay an SRV (not a null CBV): slot 0 is also sampled as an
+    /// SRV, and a single host descriptor cannot satisfy both kinds (#485).
+    #[test]
+    fn title_null_srv_at_slot_zero_stays_an_srv() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // Format R32_UINT, TEXTURE1D, default component mapping — the shape
+        // reported for the title's null SRV at heap slot 0.
+        let view = View::Shader(
+            0,
+            Some([
+                42,
+                2,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]),
+        );
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
@@ -3601,6 +3901,60 @@ mod structured_alias_tests {
         let v = view(handle).expect("placed raw SRV");
         let dyn_idx = heap.dynamic(1).expect("dynamic slot");
         assert!(!heap.make_structured_at(dyn_idx, &v, 64));
+    }
+
+    /// Buffer views mirrored for draws are tracked and refreshed when a
+    /// ResourceDescriptorHeap path asks; deferred (non-draw) mirrors are not.
+    #[test]
+    fn bindless_buffer_views_are_tracked_and_refreshed() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let mut backing = vec![0u8; 4096];
+        backing[..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let base = backing.as_ptr() as u64;
+        let _guard = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let mut slot = [0u64; 16];
+        // 64 dwords from element 0: a 256-byte raw view of the buffer start.
+        let handle = placed_raw_srv_handle(&mut slot, base, 256, 0, 64);
+
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert_eq!(
+            heap.live_buffer_count(),
+            0,
+            "deferred buffer mirrors must not track yet"
+        );
+
+        assert!(heap.mirror(0, handle, true).is_some());
+        assert_eq!(
+            heap.live_buffer_count(),
+            1,
+            "draw-time mirror must track the buffer range"
+        );
+
+        backing[..16].fill(0xAB);
+        let list = host.new_list().expect("host list");
+        heap.refresh_bindless_buffers(&list);
+        list.close();
+        host.execute(&[&list]);
+
+        let shadow = crate::shadow::find(base, 16).expect("shadow");
+        assert_eq!(
+            shadow.bytes(base, 16).expect("mapped"),
+            &[0xAB; 16],
+            "bindless refresh must copy title writes into the host copy"
+        );
+
+        heap.make_null(0);
+        assert_eq!(heap.live_buffer_count(), 0);
     }
 
     #[test]
