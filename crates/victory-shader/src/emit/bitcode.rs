@@ -518,6 +518,29 @@ impl Module {
         })
     }
 
+    /// Test builds: every call of a `dx.op` function with its arguments
+    /// that are integer constants (the opcode first), as 32-bit values.
+    #[cfg(test)]
+    pub(crate) fn dx_op_calls(&self) -> Vec<(String, Vec<Option<i32>>)> {
+        let constant = |v: &V| match v {
+            V::Const(cid) => match self.consts[*cid as usize].1 {
+                Const::Int(n) => Some(n as i32),
+                _ => None,
+            },
+            _ => None,
+        };
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(fid, args) => Some((
+                    self.funcs[*fid as usize].name.clone(),
+                    args.iter().map(constant).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
         self.insts

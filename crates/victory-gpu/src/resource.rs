@@ -580,6 +580,7 @@ impl PlacedFootprint {
         self.layout().map(|(_, _, total)| total)
     }
 }
+
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
 
 const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
@@ -1047,6 +1048,11 @@ struct Resource {
     /// The creation state and clear value the host copy is made with.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
+    /// For a depth texture the title also writes as unordered access, the
+    /// colour texture shaders write instead ([`Twin`]), made with the host
+    /// copy.
+    #[cfg(windows)]
+    twin: std::sync::OnceLock<Option<std::sync::Arc<Twin>>>,
 }
 
 #[cfg(windows)]
@@ -1071,8 +1077,20 @@ impl Resource {
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    born_seq: crate::host::birth_seq(),
                     dropped,
                 }))
+            })
+            .as_ref()
+    }
+
+    /// The colour twin, made now if this is its first use: only a depth
+    /// texture the title also writes as unordered access has one.
+    fn twin(&self, this: This) -> Option<&std::sync::Arc<Twin>> {
+        self.twin
+            .get_or_init(|| {
+                let depth = self.host(this)?;
+                twin_texture(&self.desc, &depth.texture)
             })
             .as_ref()
     }
@@ -1088,10 +1106,281 @@ impl Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) born_seq: u64,
     /// Top mip levels of the title's texture the host copy does not have
     /// (host memory pressure, see [`create_texture_with_auto_mip_drop`]):
     /// its subresource `i` is the title's `i + dropped`, per layer.
     pub(crate) dropped: u32,
+}
+
+/// The colour twin of a depth texture the title also writes as unordered
+/// access. The console allows both on one texture; the host gives a depth
+/// texture no unordered access, so shaders write a colour texture of the
+/// same size and format family instead, and one is copied into the other
+/// when a side is used after the other was written
+/// (`HostList::twin_use`).
+/// A depth texture with a stencil plane gets a twin for each plane (a
+/// title's tiled lighting writes each pixel's material class into the
+/// depth plane and masks into the stencil plane, then draws each class
+/// with the depth test "equal"): the stencil plane's is copied through a
+/// buffer, the depth plane's is drawn into the plane by a pass of ours
+/// (`HostList::pass_plane`). Unordered access views of a multisampled
+/// texture stay null.
+/// shortcut: whole textures are copied, not the mips and slices written.
+#[cfg(windows)]
+pub(crate) struct Twin {
+    /// The colour texture and the state it is in, as a host copy's.
+    pub(crate) colour: std::sync::Arc<HostTexture>,
+    /// Which side lacks what the other was written last, after the lists
+    /// submitted so far: bit 0 the depth texture, bit 1 the twin.
+    pub(crate) behind: std::sync::atomic::AtomicU32,
+    /// For a depth texture with a stencil plane, `colour` is the twin of
+    /// that plane (8 bits a texel) and this the buffer the two are copied
+    /// through: no colour format shares a family with a depth-stencil
+    /// format, but the host copies between a buffer and one plane.
+    pub(crate) through: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+    /// For a depth texture with a stencil plane: the twin of its depth
+    /// plane, 16 bits a texel for the console's 16-bit depth-stencil
+    /// formats and a 32-bit float otherwise. No host colour format holds
+    /// the bits of a 24-bit depth plane, so the two are not copied: a pass
+    /// draws the twin into the plane.
+    pub(crate) plane: Option<std::sync::Arc<HostTexture>>,
+    /// Immutable shader-visible views of this plane's subresources. The lists
+    /// referencing these descriptors keep the twin alive until they are reset.
+    pub(crate) plane_views:
+        std::sync::OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>>,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// A host texture of our own making (a twin or a plane), in `state`.
+    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> Self {
+        Self {
+            texture,
+            state: state.into(),
+            born_seq: crate::host::birth_seq(),
+            // Twins and planes are made from the title's own description.
+            dropped: 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Twin {
+    fn drop(&mut self) {
+        TWINS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Colour twins alive, depth textures with unordered access left without
+/// one, and the copies recorded into depth textures and into twins since
+/// the last frame-rate line.
+#[cfg(windows)]
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Depth planes drawn from their twins by the pass since the last
+/// frame-rate line; and since the start, how often a depth plane's twin
+/// lacked what was written to the plane (not given to it), and how often a
+/// depth plane was used in the list that had written its twin, before the
+/// pass (which runs when the list closes).
+#[cfg(windows)]
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The colour twin of title texture `this`, if it has one, made now if the
+/// texture has not been used by the host yet.
+#[cfg(windows)]
+pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).twin(this).cloned()
+}
+
+/// The twin's texture, for the unordered access views of `this`.
+#[cfg(windows)]
+pub(crate) fn twin_resource<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the twin lives as long as the host copy, which lives as long
+    // as the resource.
+    resource(this)
+        .twin(this)
+        .map(|t| unsafe { &*std::ptr::from_ref(&t.colour.texture) })
+}
+
+/// The texture of the twin of the depth plane of `this`, a depth texture
+/// with a stencil plane, for the unordered access views of that plane.
+#[cfg(windows)]
+pub(crate) fn twin_plane_resource<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    let twin = resource(this).twin(this)?;
+    // SAFETY: as in `twin_resource`.
+    twin.plane
+        .as_ref()
+        .map(|p| unsafe { &*std::ptr::from_ref(&p.texture) })
+}
+
+/// The colour twin for a texture described by `desc` whose host copy is
+/// `depth`, if the title asks for depth and unordered access both and the
+/// host can copy between the two: the same size, mips and slices in the
+/// depth format's typeless family (R16 for 16-bit depth, R32 for 32-bit),
+/// or R8 for the stencil plane of a format that has one, with unordered
+/// access only. A format with a stencil plane gets a twin for its depth
+/// plane too, R16 for the console's 16-bit depth-stencil formats and R32
+/// otherwise. `VICTORY_DEPTH_TWINS=0` makes none (such views stay null),
+/// `VICTORY_DEPTH_TWINS=stencil` only those of formats with a stencil
+/// plane, `VICTORY_DEPTH_TWINS=nodepth` none for the depth planes of such
+/// formats.
+#[cfg(windows)]
+fn twin_texture(
+    desc: &ResourceDesc,
+    depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> Option<std::sync::Arc<Twin>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    const DEPTH_AND_UNORDERED: u32 = 6;
+    const UNORDERED: u32 = 4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    // R32 and R16 typeless: the families of the depth formats of one plane.
+    const ONE_PLANE: [u32; 2] = [39, 53];
+    if desc.dimension == BUFFER || desc.flags & DEPTH_AND_UNORDERED != DEPTH_AND_UNORDERED {
+        return None;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    // R32G8X24 and R24G8 typeless: depth with a stencil plane, whose twin
+    // is R8 typeless.
+    const WITH_STENCIL: [u32; 2] = [19, 44];
+    const R8_TYPELESS: u32 = 60;
+    let typeless = family(pc_format(desc.format));
+    let stencil = WITH_STENCIL.contains(&typeless);
+    static STENCIL_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let stencil_only = *STENCIL_ONLY
+        .get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_some_and(|v| v == "stencil"));
+    if !stencil && stencil_only {
+        return None;
+    }
+    if !(stencil || ONE_PLANE.contains(&typeless)) || desc.sample_count > 1 {
+        TWINS[1].fetch_add(1, Relaxed);
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut d = *desc;
+    d.layout = 0;
+    d.alignment = 0;
+    d.flags = UNORDERED;
+    d.format = if stencil { R8_TYPELESS } else { typeless };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        ..Default::default()
+    };
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: the description has the host layout, as in `host_texture`;
+    // the out pointer is ours.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            (&raw const d).cast(),
+            D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
+            None,
+            &mut texture,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
+    }
+    let Some(texture) = texture else {
+        TWINS[1].fetch_add(1, Relaxed);
+        return None;
+    };
+    crate::host::name(&texture, || {
+        format!("depth twin {}x{} f{}", d.width, d.height, d.format)
+    });
+    // The buffer a stencil plane and its twin are copied through: as big
+    // as the plane's mips and slices laid out for a copy (they follow the
+    // depth plane's in the texture's subresources).
+    let through = if stencil {
+        // SAFETY: a live texture.
+        let of = unsafe { depth.GetDesc() };
+        let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+        let mut bytes = 0;
+        // SAFETY: a plain query; the out pointer is ours.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &of,
+                planes,
+                planes,
+                0,
+                None,
+                None,
+                None,
+                Some(&mut bytes),
+            );
+        }
+        let Some(buffer) = host.default_buffer(bytes) else {
+            TWINS[1].fetch_add(1, Relaxed);
+            return None;
+        };
+        Some(buffer)
+    } else {
+        None
+    };
+    // The twin of the depth plane of a format with a stencil plane: R16
+    // typeless (53) for the console's 16-bit depth-stencil formats (118 to
+    // 120), whose shaders write 16-bit steps, R32 typeless (39) otherwise.
+    static NO_PLANE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_plane = *NO_PLANE
+        .get_or_init(|| std::env::var_os("VICTORY_DEPTH_TWINS").is_some_and(|v| v == "nodepth"));
+    let plane = if stencil && !no_plane {
+        d.format = if (118..=120).contains(&desc.format) {
+            53
+        } else {
+            39
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: as for the first twin.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
+                None,
+                &mut texture,
+            )
+        };
+        if let Err(e) = made {
+            tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
+        }
+        texture.map(|texture| {
+            crate::host::name(&texture, || {
+                format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
+            });
+            std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS))
+        })
+    } else {
+        None
+    };
+    TWINS[0].fetch_add(1, Relaxed);
+    Some(std::sync::Arc::new(Twin {
+        colour: std::sync::Arc::new(HostTexture::new(texture, UNORDERED_ACCESS)),
+        behind: std::sync::atomic::AtomicU32::new(0),
+        through,
+        plane,
+        plane_views: Default::default(),
+    }))
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1164,8 +1453,8 @@ fn host_texture(
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
     // allows both; the title's shadow maps ask for it).
-    // shortcut: the host copy loses UAV use; give it a second view-only
-    // copy if draws write it as a UAV.
+    // The host copy loses UAV use; depth textures of one plane get a colour
+    // twin that shaders write instead ([`Twin`]).
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
@@ -1479,6 +1768,8 @@ fn hand_out_resource(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         made_with,
+        #[cfg(windows)]
+        twin: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1513,10 +1804,9 @@ impl Drop for Resource {
                 );
             }
         }
-        // A running submission may still read the host copy.
-        if let Some(host) = self.host.take().flatten() {
-            crate::host::retire(host);
-        }
+        // Forget descriptor/staging/target entries before retiring the host
+        // copy so no concurrent bindless sweep can observe it after retirement
+        // snapshots active epochs.
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER && host_writes(&self.desc) {
@@ -1531,6 +1821,12 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+        }
+        // A running submission or list that recorded work after this host copy
+        // was created may still read it.
+        if let Some(host) = self.host.take().flatten() {
+            let born = host.born_seq;
+            crate::host::retire_born(host, born);
         }
     }
 }

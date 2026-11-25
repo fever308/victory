@@ -103,6 +103,8 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
     /// Monotonic [`USE_TICK`] stamped on every staging cache hit or insert.
     last_used: AtomicU64,
+    /// Monotonic resource creation sequence for epoch-based retirement.
+    born_seq: u64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -523,7 +525,8 @@ pub(crate) fn forget(resource: usize) {
     }
     note_resident(resource as This, None);
     for staging in stagings {
-        crate::host::retire(staging);
+        let born = staging.born_seq;
+        crate::host::retire_born(staging, born);
     }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
@@ -916,6 +919,7 @@ fn create_staging(
         resource,
         last: Mutex::default(),
         last_used: AtomicU64::new(next_use_tick()),
+        born_seq: crate::host::birth_seq(),
     }))
 }
 
@@ -1258,9 +1262,39 @@ mod tests {
             return;
         };
         let (tex, host_tex) = test_texture(4, 1, 1, None);
+        let weak = {
+            let s = staging(tex, host_tex, 0).expect("staging");
+            Arc::downgrade(&s)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
         let list = host.new_list().expect("host list");
         list.mark_work();
 
+        forget(tex as usize);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "forgotten texture staging must wait for active epochs that recorded after its birth"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(weak.strong_count(), 0);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn forget_drops_new_staging_despite_older_pinned_list() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        let (tex, host_tex) = test_texture(4, 1, 1, None);
         let weak = {
             let s = staging(tex, host_tex, 0).expect("staging");
             Arc::downgrade(&s)
@@ -1270,13 +1304,11 @@ mod tests {
         forget(tex as usize);
         assert_eq!(
             weak.strong_count(),
-            1,
-            "forgotten texture staging must wait for active epochs"
+            0,
+            "staging created after stale list's last work must not leak behind it"
         );
-
-        list.close();
-        list.reset();
-        assert_eq!(weak.strong_count(), 0);
+        stale.close();
+        stale.reset();
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
         assert_eq!(release(tex), 0);
     }

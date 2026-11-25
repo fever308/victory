@@ -25,7 +25,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 
 /// [`build`] without its checks: the shader (validated by `dxil.dll` when
 /// present) and what lowering reported.
-fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
+pub(super) fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
     build_with_view(words, buffers.then_some(4))
 }
 
@@ -109,15 +109,31 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
 /// per one that ran, the UAV's 32 dwords. Empty when no SM 6.6 device is
 /// available: callers return early (`docs/code-standards.md`).
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    let samplers = [D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+    run_with_sampler(shader, views, point_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT))
+}
+
+/// A clamping sampler with this filter (a comparison filter compares with
+/// `D3D12_COMPARISON_FUNC_LESS_EQUAL`: the reference at most the texel).
+pub(super) fn point_sampler(filter: D3D12_FILTER) -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
+        Filter: filter,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
-    }];
+    }
+}
+
+/// [`run`] with the one sampler `sampler` at index 0.
+pub(super) fn run_with_sampler(
+    shader: &HostShader,
+    views: &[View],
+    sampler: D3D12_SAMPLER_DESC,
+) -> Vec<(&'static str, Vec<u32>)> {
+    let samplers = [sampler];
     let mut out = Vec::new();
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an

@@ -49,6 +49,8 @@ mod indirect;
 #[cfg(test)]
 mod indirect_budget;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

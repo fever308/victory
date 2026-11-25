@@ -10,10 +10,13 @@
 //! in its copy. Ranges shaders write go back to title memory after the
 //! submission ([`Shadow::gpu_writes`]).
 //!
-//! shortcut: only the ranges draws are known to read are brought up to
-//! date (vertex and index buffer views, constant buffers in tables, root
-//! descriptors, buffer views in tables); buffers read through directly
-//! indexed heaps keep what their first use copied.
+//! Ranges draws are known to read are brought up to date (vertex and index
+//! buffer views, constant buffers in tables, root descriptors, buffer views
+//! in tables, and buffer / constant views reached through
+//! `ResourceDescriptorHeap` via [`crate::descriptor::host::HostHeap::refresh_bindless_buffers`]).
+//! shortcut: unordered buffer ranges reached only through the heap are
+//! refreshed for reading but not copied back after the submission (a
+//! full-heap UAV snapshot is too expensive).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -34,6 +37,8 @@ pub(crate) struct Shadow {
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
+    /// Monotonic resource creation sequence for epoch-based retirement.
+    born_seq: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
@@ -135,6 +140,16 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
+    /// Where the copy starts in title memory and how long it is.
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
+    /// The offset of a title address in the copy, if it lies in it.
+    pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
+        address.checked_sub(self.start).filter(|&at| at < self.len)
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
@@ -193,6 +208,7 @@ impl Shadow {
             gpu,
             start,
             len,
+            born_seq: crate::host::birth_seq(),
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -505,7 +521,8 @@ pub(crate) fn unregister(resource: usize, start: u64) {
         map.remove(&(start, resource)).and_then(|e| e.shadow)
     };
     if let Some(shadow) = shadow {
-        crate::host::retire(shadow);
+        let born = shadow.born_seq;
+        crate::host::retire_born(shadow, born);
     }
 }
 
@@ -991,9 +1008,6 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        let list = host.new_list().expect("host list");
-        list.mark_work();
-
         let data = vec![0u8; 4096];
         let start = data.as_ptr() as u64;
         let resource = 0xdead_beef_0002_usize;
@@ -1004,15 +1018,48 @@ mod tests {
         };
         assert_eq!(weak.strong_count(), 1);
 
+        let list = host.new_list().expect("host list");
+        list.mark_work();
+
         unregister(resource, start);
         assert_eq!(
             weak.strong_count(),
             1,
-            "unregistered shadow must wait for active epochs"
+            "unregistered shadow must wait for active epochs that recorded after its birth"
         );
 
         list.close();
         list.reset();
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unregister_drops_new_shadow_despite_older_pinned_list() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0003_usize;
+        register(resource, start, data.len() as u64);
+        let weak = {
+            let shadow = find(start, 64).expect("shadow");
+            Arc::downgrade(&shadow)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
+        unregister(resource, start);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "shadow created after stale list's last work must not leak behind it"
+        );
+        stale.close();
+        stale.reset();
     }
 }
