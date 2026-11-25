@@ -286,6 +286,9 @@ extern "system" fn estimate_download(
     if let Err(hr) = validate_selectors(count, selectors.cast()) {
         return hr;
     }
+    if bytes.is_null() {
+        return xasync::E_INVALIDARG;
+    }
     if !confirm.is_null() {
         // SAFETY: checked non-null.
         unsafe { confirm.write(false) };
@@ -559,6 +562,53 @@ mod tests {
     }
 
     #[test]
+    fn estimate_with_null_bytes_fails_before_writing_confirm() {
+        // Hold the title across identifier() and both estimate calls so a
+        // parallel storage test cannot rewrite it mid-flight.
+        let _title = crate::runtime::title_test_lock();
+        let this: This = &OBJECT;
+        let ours = format!("{}\0", identifier());
+        type Estimate = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut u64,
+            *mut bool,
+        ) -> HRESULT;
+        let estimate = method::<Estimate>(&OBJECT, 0x90);
+        let none = std::ptr::null();
+
+        let mut confirm = true;
+        assert_eq!(
+            estimate(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                none,
+                std::ptr::null_mut(),
+                &mut confirm
+            ),
+            xasync::E_INVALIDARG
+        );
+        assert!(confirm, "confirm is untouched when bytes is null");
+
+        let (mut bytes, mut confirm) = (7, true);
+        assert_eq!(
+            estimate(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                none,
+                &mut bytes,
+                &mut confirm
+            ),
+            S_OK
+        );
+        assert_eq!((bytes, confirm), (0, false));
+    }
+
+    #[test]
     fn the_installation_is_complete_and_alone() {
         let this: This = &OBJECT;
         type Id = extern "system" fn(This, usize, *mut u8) -> HRESULT;
@@ -597,34 +647,6 @@ mod tests {
         method::<Progress_>(&OBJECT, 0x38)(this, monitor(), &mut p);
         assert!(p.completed && p.launchable && p.installed_bytes == p.total_bytes);
 
-        type RegisterProgress = extern "system" fn(
-            This,
-            *const c_void,
-            *mut c_void,
-            *const c_void,
-            *mut u64,
-        ) -> HRESULT;
-        let mut token_val = 0u64;
-        assert_eq!(
-            method::<RegisterProgress>(&OBJECT, 0x48)(
-                this,
-                monitor(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &mut token_val,
-            ),
-            S_OK
-        );
-        assert_ne!(token_val, 0);
-
-        type UnregisterProgress = extern "system" fn(This, *const c_void, u64, bool) -> bool;
-        assert!(method::<UnregisterProgress>(&OBJECT, 0x50)(
-            this,
-            monitor(),
-            token_val,
-            true,
-        ));
-
         type Mount = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
         let mut block = AsyncBlock {
             queue: std::ptr::null(),
@@ -637,5 +659,45 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+    }
+
+    /// Slot 0x50 must be the bool-returning unregister, not `missing::<10>`.
+    /// `E_NOTIMPL` (0x80004001) has low byte 0x01, so a bare `assert!(…)` on a
+    /// bool-typed call can pass even when the stub is still wired.
+    #[test]
+    fn unregister_installation_progress_is_not_the_missing_stub() {
+        let this: This = &OBJECT;
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let mut token_val = 0u64;
+        assert_eq!(
+            method::<Register>(&OBJECT, 0x48)(
+                this,
+                monitor(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token_val,
+            ),
+            S_OK
+        );
+        assert_ne!(token_val, 0);
+
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        let unregister = method::<Unregister>(&OBJECT, 0x50);
+        assert_eq!(
+            unregister as *const () as usize, unregister_progress as *const () as usize,
+            "slot 0x50 must be unregister_progress, not missing::<10>"
+        );
+        assert_ne!(
+            unregister as *const () as usize,
+            missing::<10> as *const () as usize
+        );
+        assert!(unregister(this, monitor(), token_val, true));
+        assert!(unregister(this, monitor(), 0, false));
     }
 }

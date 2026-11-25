@@ -8,7 +8,8 @@ use std::ffi::{c_char, c_void};
 
 use super::xasync::{self, AsyncBlock, ProviderData};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string,
+    query_interface, text, token,
 };
 
 /// The user provider.
@@ -75,9 +76,10 @@ fn found(found: bool, out: *mut Handle) -> HRESULT {
     }
 }
 
-pub static OBJECT: Object = Object::new("user", &VTABLE);
-pub static GAMERTAG_OBJECT: Object = Object::new("user gamertag", &GAMERTAG_VTABLE);
-pub static DEVICE_OBJECT: Object = Object::new("user devices", &DEVICE_VTABLE);
+pub static OBJECT: Object = Object::with_iids("user", &VTABLE, &[IID, PROVIDER]);
+pub static GAMERTAG_OBJECT: Object =
+    Object::with_iids("user gamertag", &GAMERTAG_VTABLE, &[GAMERTAG_IID]);
+pub static DEVICE_OBJECT: Object = Object::with_iids("user devices", &DEVICE_VTABLE, &[DEVICE_IID]);
 
 pub const INTERFACES: &[Interface] = &[
     (PROVIDER, IID, &OBJECT),
@@ -323,7 +325,7 @@ extern "system" fn get_max_users(_: This, out: *mut u32) -> HRESULT {
 // Unset slots (no title seen calls them): gamer pictures,
 // the UTF-16 token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
-    missing::<0> as *const (),             // 0x00 QueryInterface
+    query_interface as *const (),          // 0x00 QueryInterface
     add_ref as *const (),                  // 0x08 AddRef
     add_ref as *const (),                  // 0x10 Release: the object is static
     duplicate as *const (),                // 0x18
@@ -361,14 +363,14 @@ static VTABLE: Methods<35> = Methods([
 ]);
 
 static GAMERTAG_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     get_gamertag as *const (), // 0x18
 ]);
 
 static DEVICE_VTABLE: Methods<6> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     find_for_device as *const (), // 0x18

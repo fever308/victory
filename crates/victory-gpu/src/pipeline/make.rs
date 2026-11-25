@@ -209,7 +209,11 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .shaders
                 .iter()
                 .filter(|s| matches!(s.translated.get(), Some(None)))
-                .map(|s| format!("{} {}", s.stage, s.hash))
+                .map(|s| {
+                    let fspx = victory_shader::inspect_fspx(&s.container).is_some();
+                    let note = if fspx { " (FSPX compute module)" } else { "" };
+                    format!("{} {}{note}", s.stage, s.hash)
+                })
                 .collect();
             Some(if failed.is_empty() {
                 format!("refused {:?}", p.shaders)

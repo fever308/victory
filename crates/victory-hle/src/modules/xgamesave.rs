@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
 };
 use super::{storage, xuser};
 use crate::runtime;
@@ -47,7 +47,7 @@ pub const IID_2026: Guid = Guid::new(
     [0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9],
 );
 
-pub static OBJECT: Object = Object::new("game save", &VTABLE);
+pub static OBJECT: Object = Object::with_iids("game save", &VTABLE, &[PROVIDER, IID_2026]);
 pub const INTERFACES: &[Interface] =
     &[(PROVIDER, PROVIDER, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
@@ -953,7 +953,7 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
 }
 
 static VTABLE: Methods<30> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),         // 0x18 initialize (blocking)

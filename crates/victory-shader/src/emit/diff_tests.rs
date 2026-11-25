@@ -236,6 +236,7 @@ fn packed_pixel_inputs_read_both_halves() {
                     pack2,
                     row2: u8::from(pack2),
                 }],
+                rsrc2: Default::default(),
                 input_addr: if flat { 0 } else { 2 },
                 db_shader_control: 0,
                 patches: vec![],
@@ -1461,7 +1462,7 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, &cube_texels),
+            View::Cube(4, 1, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);

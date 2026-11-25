@@ -226,6 +226,16 @@ mod dialog {
         entry.typed
     }
 
+    /// The entry behind the dialog's user data, `None` while it is unset.
+    ///
+    /// # Safety
+    /// A non-zero `user_data` must point to a live `Entry` that nothing else
+    /// accesses for the returned lifetime.
+    unsafe fn entry_from<'a>(user_data: isize) -> Option<&'a mut Entry> {
+        // SAFETY: the caller guarantees a non-zero value is a live `Entry`.
+        unsafe { (user_data as *mut Entry).as_mut() }
+    }
+
     extern "system" fn procedure(
         dialog: HWND,
         message: u32,
@@ -246,8 +256,11 @@ mod dialog {
                     0 // focus set here
                 }
                 wm::WM_COMMAND => {
-                    let entry =
-                        &mut *(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA) as *mut Entry);
+                    // Notifications can arrive before WM_INITDIALOG stores the entry.
+                    let Some(entry) = entry_from(wm::GetWindowLongPtrW(dialog, wm::GWLP_USERDATA))
+                    else {
+                        return 0;
+                    };
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
                             let mut buffer =
@@ -267,6 +280,39 @@ mod dialog {
                 }
                 _ => 0,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn unset_user_data_is_no_entry() {
+            // SAFETY: zero is never dereferenced.
+            assert!(unsafe { entry_from(0) }.is_none());
+            let mut entry = Entry {
+                max: 4,
+                typed: None,
+            };
+            // SAFETY: `entry` is live and not otherwise accessed meanwhile.
+            let found = unsafe { entry_from((&raw mut entry) as isize) };
+            assert_eq!(found.map(|e| e.max), Some(4));
+        }
+
+        #[test]
+        fn command_before_init_is_ignored() {
+            // No window, so the user data reads as 0, as for a dialog that
+            // has not seen WM_INITDIALOG yet.
+            let notification = (0x0300 << 16) | EDIT as WPARAM; // EN_CHANGE
+            assert_eq!(
+                procedure(std::ptr::null_mut(), wm::WM_COMMAND, notification, 0),
+                0
+            );
+            assert_eq!(
+                procedure(std::ptr::null_mut(), wm::WM_COMMAND, wm::IDOK as WPARAM, 0),
+                0
+            );
         }
     }
 }

@@ -37,6 +37,18 @@ struct Journal {
     found: Vec<usize>,
 }
 
+impl Journal {
+    fn snapshot(&self, first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
+        (
+            self.asked,
+            self.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        )
+    }
+}
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
@@ -54,11 +66,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // Clean mapped-view blocks are still protected. A write, kernel-write
+    // announcement or remap invalidates the corresponding entries.
+    if guarded && first < last && guards().clean.range(first..last).copied().eq(first..last) {
+        j.asked += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        return Some(j.snapshot(first, last));
+    }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
-    let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
         GetWriteWatch(
@@ -92,13 +116,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some(j.snapshot(first, last))
 }
 
 /// The pages of `[start, end)` written, asked allocation by allocation:
@@ -110,7 +128,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// allocation, already refused).
 fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let query = |at: usize| {
@@ -122,6 +140,11 @@ fn by_allocation(start: usize, end: usize, found: &mut Vec<usize>) -> Option<Vec
     let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
     while at < end {
         let info = query(at)?;
+        // A committed section view cannot belong to a MEM_WRITE_WATCH
+        // reservation. Its other protection regions need no further queries.
+        if info.State == MEM_COMMIT && info.Type == MEM_MAPPED {
+            return None;
+        }
         let base = info.AllocationBase as usize;
         let mut committed = info.State == MEM_COMMIT;
         let mut to = (info.BaseAddress as usize + info.RegionSize).min(end);
@@ -399,6 +422,19 @@ pub fn kernel_wrote(at: usize, len: usize) {
     }
 }
 
+/// A storage worker finished writing these mapped guest pages through another
+/// view of the same section. Their address protections are still in effect.
+pub fn mapped_pages_written(addresses: impl Iterator<Item = usize>) {
+    let mut addresses = addresses.peekable();
+    if addresses.peek().is_none() {
+        return;
+    }
+    let mut g = guards();
+    for at in addresses {
+        g.clean.remove(&(at / PAGE));
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded, and kernel
 /// writes announced wholly inside it are moot (an overlapped read that
@@ -649,7 +685,16 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let end = view + 2 * BLOCK;
+        let (first, initial) = writes(view, end, true).expect("new mapped view");
+        assert_eq!(initial, [(view / PAGE, first), (view / PAGE + 1, first)]);
+        let (next, clean) = writes(view + 8, end - 1, true).expect("same protected pages");
+        assert!(next > first);
+        assert_eq!(clean, initial);
+        mapped_pages_written(std::iter::once(view + BLOCK));
+        let (alias, updated) = writes(view, end, true).expect("alias write");
+        assert_eq!(updated, [(view / PAGE, first), (view / PAGE + 1, alias)]);
+        assert_eq!(writes(view, end, true).unwrap().1, updated);
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         // `ReadFile` inside: the kernel writes the view.
@@ -670,10 +715,9 @@ mod tests {
             unsafe { std::slice::from_raw_parts((view + 100) as *const u8, 13) },
             b"from the disk"
         );
-        assert_eq!(
-            guard(view, view + 2 * BLOCK),
-            Some((view / PAGE..view / PAGE + 1).collect())
-        );
+        let (changed, pages) = writes(view, end, true).expect("kernel write visible");
+        assert_eq!(pages, [(view / PAGE, changed), (view / PAGE + 1, alias)]);
+        assert_eq!(writes(view, end, true).unwrap().1, pages);
         // SAFETY: our view.
         unsafe {
             UnmapViewOfFile(
@@ -857,7 +901,12 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let end = view + 2 * BLOCK;
+        let (first, initial) = writes(view, end, true).expect("new mapped view");
+        assert_eq!(initial, [(view / PAGE, first), (view / PAGE + 1, first)]);
+        let (next, clean) = writes(view + 8, end - 1, true).expect("same protected pages");
+        assert!(next > first);
+        assert_eq!(clean, initial);
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         let read = |file: &mut std::fs::File| {
@@ -873,10 +922,9 @@ mod tests {
             "the refresh guarded the block again under the read"
         );
         kernel_wrote(view + 100, 13);
-        assert_eq!(
-            guard(view, view + 2 * BLOCK),
-            Some((view / PAGE..view / PAGE + 1).collect())
-        );
+        let (changed, pages) = writes(view, end, true).expect("kernel write visible");
+        assert_eq!(pages, [(view / PAGE, changed), (view / PAGE + 1, first)]);
+        assert_eq!(writes(view, end, true).unwrap().1, pages);
         assert!(!read(&mut file), "guarded again once the read is done");
         // SAFETY: our view.
         unsafe {

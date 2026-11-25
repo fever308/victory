@@ -249,6 +249,37 @@ For builds without embedded helpers, supply Windows `dxcompiler.dll` and
 (use a Windows path under Proton); VIctory also searches beside the shader
 validator, beside the executable and in System32.
 
+Wine's builtin `d3dcompiler_47` is usually why the system compiler refuses
+first. Its HLSL front end has no `Load` method on an `RWByteAddressBuffer`
+(WineHQ bug [60871](https://bugs.winehq.org/show_bug.cgi?id=60871)), and no
+`Interlocked` methods until vkd3d got them after the Wine 11.0 release. The
+clamp reads its arguments with `Load` and `Load3` and updates the budget with
+`InterlockedAdd`, so on Wine 11.0 the first refusal names `Load`:
+
+```
+clamp:19:27: E5005: Method 'Load' is not defined on type 'RWByteAddressBuffer'.
+```
+
+A build whose clamp also used `InterlockedMax` was refused next, at
+`clamp:67:10: E5005: Method 'InterlockedMax' is not defined on type
+'RWByteAddressBuffer'.`
+
+Microsoft's compiler accepts the same source. Newer vkd3d has the
+`Interlocked` methods but still no `Load` on a byte-address buffer, so a
+recent Wine helps only partly. While the clamp does not compile, VIctory logs
+`no argument clamp: indirect execution dropped` and drops every indirect draw
+and dispatch: the frame counter advances, the picture stays black, and that is
+not a rendering bug to chase.
+
+Two ways out, both tried on GE-Proton11-14 (Wine 11.0) with RADV on an RX 9070
+XT:
+
+- let the DXC fallback compile it: an embedded helper, or `VICTORY_DXC`
+  pointing at `dxcompiler.dll`, or `dxcompiler.dll` beside the exe;
+- or copy Microsoft's `d3dcompiler_47.dll` into the run directory and set
+  `WINEDLLOVERRIDES=d3dcompiler_47=n,b`, which keeps the builtin as a
+  fallback. `WINEDEBUG=+loaddll` shows which one loaded.
+
 ## Diagnostics
 
 `VICTORY_D3D12_WARP`, `VICTORY_KEYS`, `VICTORY_STACKS` and the other
@@ -257,3 +288,22 @@ above; a release build ignores them. Under Proton, `VICTORY_D3D12_WARP=1`
 asks for the WARP adapter, and #41 refuses an adapter that is not a software
 one instead of using the real GPU. Add `WINEDEBUG=+seh,+loaddll` for Wine's
 view of faults and DLL loads.
+
+### Capture layers
+
+A Vulkan layer enabled for a run changes what that run does, and a crash with
+it enabled is not by itself evidence of a VIctory defect (a layer can hide one
+as easily as expose one, so check a layer-free run too). With RenderDoc's
+capture layer from
+Arch's `renderdoc` package in the instance, game runs on this machine ended
+1 s to 80 s in with a first-chance `0x80000003` followed by `0xc0000005`
+inside `victory-image-*.dll`; a control run of the same exe without the layer
+completed 60 s (37.9 fps, `frame=512 draws=3328`). A 60-second control does
+not cover faults that happen later, so keep a longer run in mind before
+blaming the layer for everything. Keep ordinary runs free of it (no
+`ENABLE_VULKAN_RENDERDOC_CAPTURE` in the environment, no `renderdoc` entry in
+`VK_INSTANCE_LAYERS` - the loader lets that override the disable filter - or
+`VK_LOADER_LAYERS_DISABLE=*renderdoc*`), check
+`/etc/vulkan/implicit_layer.d` and `/usr/share/vulkan/implicit_layer.d`, and
+confirm what actually loaded (`VK_LOADER_DEBUG=layer` lists it) before
+reporting a Wine crash.

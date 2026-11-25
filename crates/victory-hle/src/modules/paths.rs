@@ -25,6 +25,29 @@ pub(crate) fn has_drive(bytes: &[u8]) -> bool {
     )
 }
 
+/// The components of `tail` with `.` and empty parts dropped and `..`
+/// removing the previous one, so it never climbs above the root.
+fn resolve(tail: &[u16]) -> Vec<&[u16]> {
+    let dot = u16::from(b'.');
+    let mut parts: Vec<&[u16]> = Vec::new();
+    for part in tail.split(|c| SEPARATORS.contains(c)) {
+        match part {
+            [] => {}
+            [d] if *d == dot => {}
+            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            _ => parts.push(part),
+        }
+    }
+    parts
+}
+
+/// Whether `tail` has a `..` component.
+fn climbs(tail: &[u16]) -> bool {
+    let dot = u16::from(b'.');
+    tail.split(|c| SEPARATORS.contains(c))
+        .any(|part| part == [dot; 2])
+}
+
 /// `root` and the title's `tail` as a `\\?\` path. That form turns off the
 /// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
 /// here (`..` stops at the root).
@@ -43,16 +66,7 @@ pub(crate) fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     while out.last() == Some(&backslash) {
         out.pop();
     }
-    let dot = u16::from(b'.');
-    let mut parts: Vec<&[u16]> = Vec::new();
-    for part in tail.split(|c| SEPARATORS.contains(c)) {
-        match part {
-            [] => {}
-            [d] if *d == dot => {}
-            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
-            _ => parts.push(part),
-        }
-    }
+    let parts = resolve(tail);
     for part in parts {
         out.push(backslash);
         out.extend_from_slice(part);
@@ -84,6 +98,24 @@ pub(crate) fn translate(path: &[u16], mounts: &[Mount]) -> Option<Vec<u16>> {
     }
     let mut out = prefix.to_vec();
     out.extend_from_slice(root);
+    // The host would resolve `..` against the real directory, above the
+    // mount root, so a short path with one is rewritten like a long one.
+    if prefix.is_empty() && climbs(tail) {
+        let backslash = u16::from(b'\\');
+        while out.last() == Some(&backslash) {
+            out.pop();
+        }
+        let parts = resolve(tail);
+        for part in &parts {
+            out.push(backslash);
+            out.extend_from_slice(part);
+        }
+        if parts.is_empty() || tail.last().is_some_and(|c| SEPARATORS.contains(c)) {
+            out.push(backslash);
+        }
+        out.push(0);
+        return Some(out);
+    }
     // `X:` and `X:name` are relative to the root.
     if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
         out.push(b'\\'.into());
@@ -186,6 +218,27 @@ mod tests {
         let tail = format!("X:{}", "a".repeat(LONG - r"C:\games\title".len() - 1));
         assert!(host(&tail).starts_with(r"C:\games\title"));
         assert!(!host(&tail).starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn short_paths_cannot_climb_above_the_root() {
+        assert_eq!(host(r"X:\..\secret.dat"), r"C:\games\title\secret.dat");
+        assert_eq!(
+            host(r"X:\..\..\..\secret.dat"),
+            r"C:\games\title\secret.dat"
+        );
+        assert_eq!(host("X:../secret.dat"), r"C:\games\title\secret.dat");
+        assert_eq!(host("X:/a/../../b/./c"), r"C:\games\title\b\c");
+        assert_eq!(host(r"X:\sub\..\save.dat"), r"C:\games\title\save.dat");
+        assert_eq!(host(r"x:\sub/..\save.dat"), r"C:\games\title\save.dat");
+        assert_eq!(host(r"X:\.."), r"C:\games\title\");
+        assert_eq!(host(r"X:\sub\..\"), r"C:\games\title\");
+        assert_eq!(host(r"X:\a\..\b\"), r"C:\games\title\b\");
+        assert_eq!(host(r"G:\..\x"), r"D:\package\x");
+        assert_eq!(host(r"U:\..\x"), r"\\server\share\x");
+        assert_eq!(host(r"T:\..\x"), r"\\?\E:\temp\x");
+        // Names that merely contain dots are ordinary.
+        assert_eq!(host(r"X:\..a\b..\c"), r"C:\games\title\..a\b..\c");
     }
 
     #[test]

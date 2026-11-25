@@ -14,6 +14,7 @@ pub(crate) const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub(crate) const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 pub(crate) const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 pub(crate) const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+pub(crate) const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 pub(crate) const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// What D3D and DXGI return for a missing item (adapter, output, private
 /// data).

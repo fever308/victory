@@ -23,8 +23,10 @@
 //!   position in [`HostShader::samplers`] (the console sampler words) and
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
-//!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host.
+//!   immediate sampler used for comparison has a comparison filter there
+//!   (bit 0x80); the same console words used both ways get two slots so
+//!   annotateHandle matches `dx.resources`. A heap sampler used for
+//!   comparison must be a comparison sampler on the host.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
@@ -78,16 +80,28 @@
 //!   declares and the rasterizer system values.
 
 mod bitcode;
+#[cfg(test)]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod half_src_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_tests;
+#[cfg(all(test, windows))]
+mod intersect_tests;
 #[cfg(all(test, windows))]
 mod lane_mask_tests;
 #[cfg(test)]
 mod lds_tests;
 mod lower;
+#[cfg(test)]
+mod mad_flush_tests;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod mtbuf_tests;
 mod rect;
@@ -112,7 +126,10 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    USER_DATA_SPACE, USER_MEMORY_BASE,
+};
 
 /// Resource heap indices at or past this go to slot 0 in translated
 /// shaders (a negative or garbage index must not reach past the heap's
@@ -244,7 +261,7 @@ impl HostShader {
         let n = self
             .user_data
             .iter()
-            .map(|u| u.index + 1)
+            .map(|u| u.index + if u.indexed_buffer { 3 } else { 1 })
             .max()
             .unwrap_or(0);
         n.next_multiple_of(4)
@@ -254,6 +271,9 @@ impl HostShader {
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
+    /// The root constant selects a heap buffer. At `index` the host supplies
+    /// its bounded raw SRV slot, element stride in bytes and alignment bias.
+    pub indexed_buffer: bool,
     /// Dword in the user-data buffer (the console's user-data index).
     pub index: u32,
     /// Root parameter index in the title's root signature.
@@ -308,15 +328,28 @@ pub fn translate_with_view_strides(
     translate_program(container, allow_wave32, Some(view_stride))
 }
 
+/// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
+const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
+    offset: 0,
+    what: "FSPX compute module",
+};
+
 fn translate_program(
     container: &[u8],
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+    if container.starts_with(crate::dxbc::Fspx::MAGIC) {
+        return Err(FSPX_UNSUPPORTED);
+    }
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Err(if c.fspx().is_some() {
+            FSPX_UNSUPPORTED
+        } else {
+            ShaderError::Malformed("no DXIL part")
+        });
+    };
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
@@ -746,6 +779,27 @@ mod tests {
     use super::{parse_loop_limit, parse_shader_opt};
 
     #[test]
+    fn fspx_modules_are_unsupported_not_missing_dxil() {
+        let fspx = crate::dxbc::Fspx::assemble(&[0; 28], &[], &[0x55; 8], &[]);
+        let wrapped = crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]);
+        for bytes in [&fspx, &wrapped] {
+            assert_eq!(
+                super::translate(bytes).unwrap_err(),
+                crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "FSPX compute module"
+                }
+            );
+        }
+        // Without an FSPX module it is still the missing DXIL part.
+        let plain = crate::dxbc::build(&[(crate::FourCC::ACCC, b"other")]);
+        assert_eq!(
+            super::translate(&plain).unwrap_err(),
+            crate::ShaderError::Malformed("no DXIL part")
+        );
+    }
+
+    #[test]
     fn the_shader_opt_switch_parses_or_falls_back() {
         let all = super::bitcode::opt::ALL;
         assert_eq!(parse_shader_opt(None), all);
@@ -831,6 +885,7 @@ mod tests {
             used: vec![],
             io: StageIo::Ps {
                 inputs: vec![],
+                rsrc2: Default::default(),
                 input_addr: 0,
                 db_shader_control: 0,
                 patches: vec![],
@@ -843,6 +898,49 @@ mod tests {
         let outputs = signature_part(&c, FourCC::OSG1).unwrap();
         assert_eq!((inputs[0].row, inputs[0].col), (None, 0));
         assert_eq!(outputs[0].row, Some(0));
+        #[cfg(windows)]
+        if let Some(mut v) = validator::Validator::for_test() {
+            v.validate(&mut host.dxil.clone()).unwrap();
+        }
+    }
+
+    /// `SPI_PS_INPUT_ADDR` bit 14 delivers the coverage mask in a VGPR. DXIL
+    /// reads it with `dx.op.coverage.i32`, and `SV_Coverage` is not a pixel
+    /// input there, so a console signature that lists it loses the element.
+    #[test]
+    fn pixel_sample_coverage_input_lowers_to_the_coverage_intrinsic() {
+        let mut coverage = varying("SV_Coverage", 0, 0);
+        coverage.kind = 14;
+        coverage.comp = 5;
+        coverage.row = None;
+        coverage.cols = 1;
+        let mut target = varying("SV_Target", 0, 3);
+        target.kind = 16;
+        let inputs = container::signature(&[coverage], true);
+        let outputs = container::signature(&[target], false);
+        let source = crate::dxbc::build(&[(FourCC::ISG1, &inputs), (FourCC::OSG1, &outputs)]);
+        let c = Container::parse(&source).unwrap();
+        // exp mrt0 v0, v0, v0, v0 (done); s_endpgm
+        let words = [0xF800_180Fu32, 0, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 14,
+                rsrc2: Default::default(),
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let c = Container::parse(&host.dxil).unwrap();
+        let inputs = signature_part(&c, FourCC::ISG1).unwrap();
+        assert!(inputs.iter().all(|e| e.kind != 14), "{inputs:?}");
         #[cfg(windows)]
         if let Some(mut v) = validator::Validator::for_test() {
             v.validate(&mut host.dxil.clone()).unwrap();
@@ -900,10 +998,67 @@ mod tests {
                 ..
             })
         ));
-        let mut pixel = super::shader::Shader::new(true);
-        pixel.inputs = vec![varying("value", 8, 8), varying("value", 10, 9)];
-        pixel.m.terminate(pixel.entry, super::bitcode::Term::Ret);
-        let ps = pixel.finish();
+        // The pixel program declares all ten varyings but reads only the
+        // eighth and tenth. The translated loads must follow their new IDs.
+        let inputs: Vec<_> = (1..=10).map(|n| varying("value", n, n - 1)).collect();
+        let mut target = varying("SV_Target", 0, 0);
+        target.kind = 16;
+        let isg1 = container::signature(&inputs, true);
+        let target = container::signature(&[target], false);
+        let pixel_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &target)]);
+        let pixel = NativeProgram {
+            stage: HwStage::Ps,
+            vgprs: 4,
+            io: StageIo::Ps {
+                inputs: [7, 9]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(attr, row)| crate::native::PsInput {
+                        usage: Usage::Generic,
+                        row,
+                        mask: 15,
+                        attr: attr as u8,
+                        flat: true,
+                        fp16: false,
+                        pack2: false,
+                        row2: row,
+                    })
+                    .collect(),
+                input_addr: 0,
+                rsrc2: Default::default(),
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: [
+                0xC80A_0002u32, // v_interp_mov_f32 v2, p0, attr0.x
+                0xC80E_0402,    // v_interp_mov_f32 v3, p0, attr1.x
+                0xF800_180F,
+                0x0302_0302, // exp mrt0, v2, v3, v2, v3
+                0xBF81_0000,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+            ..native.clone()
+        };
+        let ps = translate_native(
+            &Container::parse(&pixel_bytes).unwrap(),
+            &pixel,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .dxil;
+        let consumer = Container::parse(&ps).unwrap();
+        assert_eq!(
+            signature_part(&consumer, FourCC::ISG1)
+                .unwrap()
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            [8, 10]
+        );
         let linked = translate_mesh_for_pixel(&c, &native, Some(&ps))
             .unwrap()
             .unwrap();
@@ -964,6 +1119,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1001,6 +1157,208 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// Translates the pixel program `words` (no inputs or exports) with
+    /// `rsrc2` and root `layout`, and returns the emitted DXIL.
+    fn pixel_program(
+        rsrc2: u32,
+        layout: Vec<crate::native::RootParam>,
+        used: Vec<crate::native::UsedResource>,
+        words: &[u32],
+    ) -> Result<Vec<u8>, ShaderError> {
+        use crate::native::PsRsrc2;
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout,
+            used,
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                rsrc2: PsRsrc2(rsrc2),
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[
+            (FourCC::ISG1, &container::signature(&[], true)),
+            (FourCC::OSG1, &container::signature(&[], false)),
+        ]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native)?;
+        Ok(emit(&c, &native, &p, &st, &io, &res)?.dxil)
+    }
+
+    fn table_param(user_data: u8) -> crate::native::RootParam {
+        crate::native::RootParam {
+            root: crate::native::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: 0,
+        }
+    }
+
+    /// `pixel_program` for a program with one user SGPR (s0, a descriptor
+    /// table) that runs `body` and stores s4 to the table's buffer UAV, so
+    /// the value of s4 is used.
+    fn pixel_uav_store(rsrc2: u32, body: &[u32]) -> Result<Vec<u8>, ShaderError> {
+        use crate::native::{ResourceType, RootType, UsedResource};
+        let mut words = vec![
+            0xBE86_0300, // s_mov_b32 s6, s0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        ];
+        words.extend_from_slice(body);
+        words.extend_from_slice(&[
+            0x7E00_0204, // v_mov_b32 v0, s4
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        pixel_program(rsrc2, vec![table_param(0)], used, &words)
+    }
+
+    fn sfi0_features(dxil: &[u8]) -> u64 {
+        let host = Container::parse(dxil).unwrap();
+        let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+        u64::from_le_bytes(sfi0.try_into().unwrap())
+    }
+
+    /// A POPS pixel program (`LOAD_COLLISION_WAVEID`) reads the collision
+    /// wave id SGPR after the primitive mask and compares its fields with
+    /// `src_pops_exiting_wave_id` to wait for the earlier waves that cover
+    /// its pixels. Both translate as a wave that overlaps none, and the UAV
+    /// is rasterizer ordered (D3D_SHADER_FEATURE_ROVS, 0x1000, in SFI0).
+    #[test]
+    fn a_pops_pixel_program_orders_its_uavs_on_the_host() {
+        let body = [
+            0x9003_9F02, // s_lshr_b32 s3, s2, 31 (the wave overlaps another)
+            0x8104_03EF, // s_add_i32 s4, src_pops_exiting_wave_id, s3
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        ];
+        let dxil = pixel_uav_store(1 << 1 | 1 << 25, &body).unwrap();
+        let features = sfi0_features(&dxil);
+        assert_ne!(features & 0x1000, 0, "SFI0 {features:#x}: no ROVs");
+    }
+
+    /// Without `LOAD_COLLISION_WAVEID` the same store is no ROV. s2 is then
+    /// above the SGPRs the hardware initializes, and since no instruction
+    /// writes it, reading it stays refused, as in compute programs.
+    #[test]
+    fn a_pixel_program_without_pops_keeps_plain_uavs() {
+        let dxil = pixel_uav_store(1 << 1, &[0xBE84_0380]).unwrap(); // s_mov_b32 s4, 0
+        let features = sfi0_features(&dxil);
+        assert_eq!(features & 0x1000, 0, "SFI0 {features:#x}: ROVs");
+        let body = [0x9004_9F02]; // s_lshr_b32 s4, s2, 31
+        assert!(pixel_uav_store(1 << 1, &body).is_err());
+        // src_pops_exiting_wave_id has no value there.
+        let body = [0x8104_03EF]; // s_add_i32 s4, src_pops_exiting_wave_id, s3
+        assert!(pixel_uav_store(1 << 1, &body).is_err());
+    }
+
+    /// The primitive mask (s1 with one user SGPR) arrives in every pixel
+    /// program. A path that reuses its register and one that keeps it join
+    /// in a phi, which the read after them takes only on the reusing path:
+    /// the phi still needs a value for the mask.
+    #[test]
+    fn a_primitive_mask_joined_with_a_reused_register_translates() {
+        let body = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBE81_0387, // s_mov_b32 s1, 7
+            0xBF85_0001, // s_cbranch_scc1 +1 (the same condition)
+            0xBE84_0301, // s_mov_b32 s4, s1 (only where s1 is 7)
+        ];
+        pixel_uav_store(1 << 1, &body).unwrap();
+    }
+
+    /// A POPS pixel program (`LOAD_COLLISION_WAVEID`) reads the collision
+    /// wave id SGPR after the primitive mask and compares its fields with
+    /// `src_pops_exiting_wave_id`. Both translate as a wave that overlaps no
+    /// earlier one.
+    #[test]
+    fn a_pops_pixel_program_translates() {
+        let body = [
+            0x9003_9F02, // s_lshr_b32 s3, s2, 31 (the wave overlaps another)
+            0x8104_03EF, // s_add_i32 s4, src_pops_exiting_wave_id, s3
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        ];
+        pixel_uav_store(1 << 1 | 1 << 25, &body).unwrap();
+    }
+
+    /// Without `LOAD_COLLISION_WAVEID` s2 is above the SGPRs the hardware
+    /// initializes (one user SGPR and the primitive mask), and
+    /// `src_pops_exiting_wave_id` has no value. No instruction writes s2, so
+    /// reading it stays refused, as in compute programs.
+    #[test]
+    fn a_pixel_program_without_pops_refuses_its_inputs() {
+        let plain = |body: &[u32]| pixel_uav_store(1 << 1, body);
+        plain(&[0xBE84_0380]).unwrap(); // s_mov_b32 s4, 0
+        assert!(plain(&[0x9004_9F02]).is_err()); // s_lshr_b32 s4, s2, 31
+        assert!(plain(&[0x8104_03EF]).is_err()); // s_add_i32 s4, src_pops_exiting_wave_id, s3
+    }
+
+    /// The scratch wave offset follows the system SGPRs when `SCRATCH_EN`
+    /// (bit 0) is set, so s2 is then among the initialized SGPRs: reading
+    /// it is no longer the refusal of an SGPR above them, but of an input
+    /// not modelled.
+    #[test]
+    fn the_scratch_wave_offset_is_an_initialized_pixel_sgpr() {
+        let body = [0x9004_9F02]; // s_lshr_b32 s4, s2, 31
+        let why = |rsrc2| format!("{:?}", pixel_uav_store(rsrc2, &body).unwrap_err());
+        assert!(why(1 << 1).contains("above the initialized ones"));
+        let scratch = why(1 << 1 | 1);
+        assert!(!scratch.contains("above the initialized ones"), "{scratch}");
+    }
+
+    /// A pixel program loads a descriptor through the heap's base address,
+    /// the pair s[2:3], with the heap stated at user-data dword 10 and the
+    /// index in a root constant (s6). Without the pair belonging to the
+    /// heap parameter, s2 and s3 were hardware SGPR inputs.
+    #[test]
+    fn a_pixel_program_reads_descriptors_through_the_heap_base_pair() {
+        use crate::native::{RootParam, RootType};
+        let param = |root, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let layout = vec![
+            param(RootType::Constants, 6, 0),
+            param(RootType::ResourceHeap, 10, 1),
+        ];
+        let words = [
+            0x8F08_8506, // s_lshl_b32 s8, s6, 5
+            0xF408_0201,
+            0x1000_0000, // s_load_dwordx4 s[8:11], s[2:3], s8
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            0xBF81_0000, // s_endpgm
+        ];
+        pixel_program(1 << 1, layout, vec![], &words).unwrap();
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1284,6 +1642,7 @@ mod tests {
                         row2: 0,
                     }],
                     input_addr,
+                    rsrc2: Default::default(),
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -1351,6 +1710,7 @@ mod tests {
                         pack2: false,
                         row2: 0,
                     }],
+                    rsrc2: Default::default(),
                     input_addr: 1 << 1,
                     db_shader_control: 0,
                     patches: vec![],
@@ -1423,6 +1783,7 @@ mod tests {
                     row2: 0,
                 }],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },

@@ -128,6 +128,11 @@ struct List {
     has_work: std::sync::atomic::AtomicBool,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// `pInitialState` from CreateCommandList / Reset. On Windows the same
+    /// pointer lives in `state.pipeline`; this field covers the Create/Reset
+    /// wiring on hosts without a GPU.
+    #[cfg(not(windows))]
+    initial_pipeline: std::sync::atomic::AtomicUsize,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -180,6 +185,15 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(&list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Updates draw state even when no host GPU / host list is available (so
+/// Create/Reset `pInitialState` stays testable without D3D12).
+#[cfg(windows)]
+fn with_draw_state(this: This, f: impl FnOnce(&mut crate::draw::State)) {
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    f(&mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// Marks the active host list segment as having recorded GPU or deferred work.
 #[cfg(windows)]
 fn mark_work(this: This) {
@@ -205,7 +219,9 @@ pub(crate) fn segments(this: This) -> Vec<Segment> {
     let segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = segments.clone();
     if let Some(current) = host.as_ref()
-        && (list.has_work.load(std::sync::atomic::Ordering::Acquire) || out.is_empty())
+        && (list.has_work.load(std::sync::atomic::Ordering::Acquire)
+            || current.has_epoch()
+            || out.is_empty())
     {
         out.push(Segment::List(current.clone()));
     }
@@ -287,6 +303,9 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    // D3D12 CreateCommandList opens with pInitialState already bound, as Reset
+    // does: remember it and log first-bind like SetPipelineState.
+    apply_initial_pipeline(pipeline);
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -316,13 +335,19 @@ fn new_list(
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
-            state.set_pipeline(pipeline);
+            state.reset(pipeline);
             std::sync::Mutex::new(state)
         },
+        #[cfg(not(windows))]
+        initial_pipeline: std::sync::atomic::AtomicUsize::new(pipeline as usize),
     });
-    #[cfg(not(windows))]
-    let _ = pipeline;
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+}
+
+/// Logs first-bind for CreateCommandList / Reset `pInitialState`, matching
+/// [`set_pipeline`].
+fn apply_initial_pipeline(pipeline: This) {
+    crate::pipeline::bound(pipeline);
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -403,15 +428,24 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             (false, false)
         }
     };
+    apply_initial_pipeline(pipeline);
     #[cfg(windows)]
-    with_state(this, |host, state| {
-        if !fresh && !keep_pending {
-            host.reset();
-        }
-        state.reset(pipeline);
-    });
+    {
+        // Remember the PSO even when there is no host list (no D3D12 device):
+        // `with_state` alone would skip the update and leave Create's pipeline.
+        with_draw_state(this, |state| state.reset(pipeline));
+        with_state(this, |host, _| {
+            if !fresh && !keep_pending {
+                host.reset();
+            }
+        });
+    }
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    {
+        let _ = uploads;
+        list.initial_pipeline
+            .store(pipeline as usize, std::sync::atomic::Ordering::Release);
+    }
     S_OK
 }
 
@@ -470,7 +504,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                // A depth texture's unordered access is its colour twin's
+                // (the host gives the depth texture none): the barrier is
+                // on the texture shaders write.
+                match crate::resource::twin_resource(b.first) {
+                    Some(twin) => twin.as_raw().cast_const().cast(),
+                    None => host(b.first)?,
+                }
             },
             ..*b
         }),
@@ -570,6 +610,25 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether a title texture's host copy lacks its top mip levels (host
+/// memory pressure). Title copies index the title's subresources and name
+/// its sizes, so they are not replayed on such a copy: its contents come
+/// from title memory instead.
+// shortcut: a copy into or out of a mip-dropped texture is skipped, so
+// what the title only ever wrote there by copy stays as detiled from its
+// memory.
+#[cfg(windows)]
+fn mip_dropped(texture: This) -> bool {
+    let dropped = crate::resource::dropped_mips(texture) > 0;
+    if dropped {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!("copy skipped: a host texture lost mips to memory pressure");
+        });
+    }
+    dropped
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -601,9 +660,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if mip_dropped(dst) || mip_dropped(src) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(dst, false, true);
+            list.twin_use(src, false, false);
             ensure_state(&list, dst, COPY_DEST);
             ensure_state(&list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -677,6 +742,9 @@ extern "system" fn copy_texture_region(
             ) else {
                 return;
             };
+            if mip_dropped(src.resource) {
+                return;
+            }
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
                 return;
             };
@@ -725,6 +793,8 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
                 return;
             };
+            // A depth texture shaders also write: what they wrote, first.
+            list.twin_use(src.resource, false, false);
             crate::texture::upload(&list, src.resource, from_tex);
             ensure_state(&list, src.resource, COPY_SOURCE);
             list.mark_work();
@@ -777,6 +847,9 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        if mip_dropped(dst.resource) || (src.kind != FOOTPRINT && mip_dropped(src.resource)) {
+            return;
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -791,8 +864,11 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
+            // Host-owned mapped upload (not title memory): `defer_fill` so
+            // `copy_mapped` skips the title-destination VirtualQuery guard.
+            // Wine+vkd3d can report Map memory as MEM_FREE; `defer_copy` would
+            // then skip the upload (#518). Buffer→buffer title destinations
+            // above keep `defer_copy`.
             list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
@@ -809,9 +885,11 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
+            list.twin_use(src.resource, false, false);
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
+        list.twin_use(dst.resource, false, true);
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         list.mark_work();
@@ -886,6 +964,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if mip_dropped(dst) || mip_dropped(src) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,
@@ -894,6 +975,8 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        list.twin_use(dst, false, true);
+        list.twin_use(src, false, false);
         ensure_state(&list, dst, RESOLVE_DEST);
         ensure_state(&list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1182,6 +1265,8 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        // A clear is a write; a partial one keeps what the twin held.
+        list.twin_use(record.resource, false, true);
         list.mark_work();
         ensure_state(&list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
@@ -1301,11 +1386,16 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
-    crate::pipeline::bound(pipeline);
+    apply_initial_pipeline(pipeline);
     #[cfg(windows)]
-    with_state(this, |_, state| state.set_pipeline(pipeline));
+    with_draw_state(this, |state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
-    let _ = this;
+    {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        list.initial_pipeline
+            .store(pipeline as usize, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
@@ -1527,8 +1617,9 @@ mod state {
         if indirect != 0 {
             const MESH: u32 = 10;
             let mut ran = false;
+            let mut dropped = "";
             with_state(this, |list, s| {
-                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None);
+                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None, &mut dropped);
             });
             if !ran {
                 super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1619,6 +1710,7 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    let mut dropped = "";
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
@@ -1631,9 +1723,16 @@ extern "system" fn execute_indirect(
             *kind
         };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter, &mut dropped);
         });
     } else {
+        dropped = if args.len() != 1 {
+            "a signature of more than one argument"
+        } else if address.is_none() {
+            "arguments outside title buffers"
+        } else {
+            "count outside title buffers"
+        };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -1645,16 +1744,42 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    // Once per signature and reason: what the records hold is only worth
+    // saying when the reason is new too.
+    static SEEN: std::sync::Mutex<Vec<(usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&(signature as usize)) {
-        seen.push(signature as usize);
+    if !seen.contains(&(signature as usize, dropped)) {
+        seen.push((signature as usize, dropped));
+        // The records from a host copy that already exists, never one made
+        // here: its bytes are as of that copy's last refresh, before this
+        // submission and any producer earlier in this list. A buffer with no
+        // copy reads as absent rather than as zeroes.
+        #[cfg(windows)]
+        let records = address.and_then(|at| {
+            let shadow = crate::shadow::peek(at, u64::from(stride))?;
+            let bytes = shadow.bytes(at, u64::from(stride))?;
+            // A stride that is not a multiple of four leaves a tail out
+            // rather than panicking in this callback.
+            let (words, _tail) = bytes.as_chunks::<4>();
+            Some(
+                words
+                    .iter()
+                    .map(|w| u32::from_le_bytes(*w))
+                    .collect::<Vec<u32>>(),
+            )
+        });
+        #[cfg(not(windows))]
+        let records: Option<Vec<u32>> = None;
         tracing::info!(
             stride,
-            ?args,
+            // The command signature's descriptor, not the records: its
+            // fields past the type are whatever the title left in the union.
+            signature = ?args,
+            ?records,
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
+            reason = dropped,
             "indirect execution dropped (first time for this signature)"
         );
     }
@@ -1959,21 +2084,24 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
-    #[cfg(windows)]
     #[test]
     fn command_list_creation_keeps_the_initial_pipeline() {
-        use windows::Win32::Graphics::Direct3D12::ID3D12PipelineState;
-        use windows::core::Interface;
-
         let null = std::ptr::null();
-        let iid = ID3D12PipelineState::IID;
+        // PC ID3D12PipelineState IID — create_compute only needs a matching
+        // hand-out id; no host GPU or shader bytes are required.
+        let iid = guid(
+            0x765a30f3,
+            0xf624,
+            0x4c6f,
+            [0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45],
+        );
         // SAFETY: ComputeHead contains only raw pointers and a byte count. No
         // shader is needed to verify which pipeline object the list remembers.
         let desc: crate::pipeline::ComputeHead = unsafe { std::mem::zeroed() };
         let mut pipeline = null;
         let mut allocator = null;
         assert_eq!(
-            crate::pipeline::create_compute(null, &desc, (&raw const iid).cast(), &mut pipeline),
+            crate::pipeline::create_compute(null, &desc, &iid, &mut pipeline),
             S_OK
         );
         assert_eq!(
@@ -1987,13 +2115,18 @@ mod tests {
             barrier_batch: 0,
         };
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        let bound = |list: This| {
+        let bound = |list: This| -> This {
             // SAFETY: the test owns this live command list.
-            unsafe { &*list.cast::<List>() }
-                .state
-                .lock()
-                .unwrap()
-                .current_pipeline()
+            let list = unsafe { &*list.cast::<List>() };
+            #[cfg(windows)]
+            {
+                list.state.lock().unwrap().current_pipeline()
+            }
+            #[cfg(not(windows))]
+            {
+                list.initial_pipeline
+                    .load(std::sync::atomic::Ordering::Acquire) as This
+            }
         };
         let created_with = [false, true].map(|extended| {
             let mut list = null;
@@ -2004,14 +2137,16 @@ mod tests {
             };
             assert_eq!(hr, S_OK);
             let initial = bound(list);
-            if host_list(list).is_some() {
-                assert_eq!(close(list), S_OK);
-                assert_eq!(reset_x(list, allocator, null, 0), S_OK);
-                assert_eq!(bound(list), null);
-                assert_eq!(close(list), S_OK);
-                assert_eq!(reset(list, allocator, pipeline), S_OK);
-                assert_eq!(bound(list), pipeline);
-            }
+            assert_eq!(
+                initial, pipeline,
+                "CreateCommandList must keep pInitialState"
+            );
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset_x(list, allocator, null, 0), S_OK);
+            assert_eq!(bound(list), null);
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset(list, allocator, pipeline), S_OK);
+            assert_eq!(bound(list), pipeline);
             assert_eq!(release(list), 0);
             initial
         });
@@ -2903,6 +3038,14 @@ mod tests {
         state::blend_factor(list, &blend);
         state::stencil_ref(list, 0);
         set_pipeline(list, null);
+        // Empty OMSetRenderTargets (0 targets, null depth) must not pin an epoch.
+        slot::<extern "system" fn(This, u32, *const u64, i32, *const u64)>(list, 0x190)(
+            list,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
         let (c_idle, d_idle) = crate::host::DropCounter::new();
         crate::host::retire(c_idle);
         assert_eq!(

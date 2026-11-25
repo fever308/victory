@@ -34,9 +34,30 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
+    // Reserve min(cost, remaining) with a saturating compare-and-exchange so
+    // the counter never passes BUDGET (a plain add would wrap at 2^32 after
+    // enough rejected records and reopen the budget). Both exits share the
+    // single store below.
+    bool reject = false;
     uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    budget.InterlockedAdd(0, 0u, before);
+    [allow_uav_condition]
+    while (true) {
+        if (before >= BUDGET) {
+            reject = true;
+            break;
+        }
+        uint remaining = BUDGET - before;
+        uint next = before + min(cost, remaining);
+        uint observed;
+        budget.InterlockedCompareExchange(0, before, next, observed);
+        if (observed == before) {
+            reject = cost > remaining;
+            break;
+        }
+        before = observed;
+    }
+    if (reject) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }

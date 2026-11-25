@@ -411,6 +411,7 @@ static FUNCTIONS: Table<160> = {
     f[48] = queue::create_x as *const (); // 0x180
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = pipeline::deserialize_compute_x as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -458,12 +459,10 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
-        // Not written yet, so they fail: the title takes S_OK from them as success, goes on
-        // to use what they should have produced and faults in its own code.
+        // Not written yet, so it fails: the title takes S_OK from it as success, goes on
+        // to use what it should have produced and faults in its own code.
         let s1c8 = slot::<extern "system" fn() -> HRESULT>(device, 0x1c8);
         assert_eq!(s1c8(), E_NOTIMPL);
-        let s218 = slot::<extern "system" fn() -> HRESULT>(device, 0x218);
-        assert_eq!(s218(), E_NOTIMPL);
     }
 
     #[test]

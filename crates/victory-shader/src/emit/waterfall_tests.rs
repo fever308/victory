@@ -25,7 +25,11 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 
 /// [`build`] without its checks: the shader (validated by `dxil.dll` when
 /// present) and what lowering reported.
-fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
+pub(super) fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
+    build_with_view(words, buffers.then_some(4))
+}
+
+fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lower::Lowered) {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -44,8 +48,8 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
         user_data,
         slot: user_data,
     };
-    let views = if buffers {
-        range(ResourceType::Srv, 0, 4, 4, 0)
+    let views = if let Some(stride) = buffer_stride {
+        range(ResourceType::Srv, 0, 4, stride, 0)
     } else {
         range(ResourceType::Srv, 0, 8, 0, 0)
     };
@@ -102,17 +106,34 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 /// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
+/// per one that ran, the UAV's 32 dwords. Empty when no SM 6.6 device is
+/// available: callers return early (`docs/code-standards.md`).
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    let samplers = [D3D12_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+    run_with_sampler(shader, views, point_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT))
+}
+
+/// A clamping sampler with this filter (a comparison filter compares with
+/// `D3D12_COMPARISON_FUNC_LESS_EQUAL`: the reference at most the texel).
+pub(super) fn point_sampler(filter: D3D12_FILTER) -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
+        Filter: filter,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
-    }];
+    }
+}
+
+/// [`run`] with the one sampler `sampler` at index 0.
+pub(super) fn run_with_sampler(
+    shader: &HostShader,
+    views: &[View],
+    sampler: D3D12_SAMPLER_DESC,
+) -> Vec<(&'static str, Vec<u32>)> {
+    let samplers = [sampler];
     let mut out = Vec::new();
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
@@ -153,6 +174,16 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     out
 }
 
+/// False when no SM 6.6 hardware GPU or WARP ran; the caller returns early.
+fn device_ran<T>(results: &[T]) -> bool {
+    if results.is_empty() {
+        eprintln!("neither hardware nor WARP SM 6.6 device available; skipped");
+        false
+    } else {
+        true
+    }
+}
+
 /// The red channel each lane sampled from two 1x1 textures, red 1.0 at
 /// heap index 0 and 2.0 at 1.
 fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
@@ -173,7 +204,11 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;
     let shader = build(WATERFALL_JOINED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
+    let results = sampled(&shader);
+    if !device_ran(&results) {
+        return;
+    }
+    for (label, red) in results {
         // Lanes below 16 took the first texture, the others the second.
         let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
         assert_eq!(red, want, "{label}");
@@ -184,7 +219,11 @@ fn lanes_sample_the_texture_their_if_else_arm_chose() {
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
     let shader = build(WATERFALL_JOINED_MIXED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
+    let results = sampled(&shader);
+    if !device_ran(&results) {
+        return;
+    }
+    for (label, red) in results {
         // Lanes below 16 loaded entry (lane & 1); of the others, lanes
         // below 24 picked the first, the rest the second.
         let want: Vec<f32> = (0..32)
@@ -215,7 +254,11 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
         },
         View::RawUav(32),
     ];
-    for (label, got) in run(&shader, &views) {
+    let results = run(&shader, &views);
+    if !device_ran(&results) {
+        return;
+    }
+    for (label, got) in results {
         // Dword `lane` of the first buffer below 16, of the second from 16
         // to 23; lanes from 24 on load and store nothing.
         let want: Vec<u32> = (0..32)
@@ -234,7 +277,9 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
     let shader = build(WATERFALL_INDEXED_WAVE32, false);
     let results = sampled(&shader);
-    assert!(!results.is_empty());
+    if !device_ran(&results) {
+        return;
+    }
     for (label, red) in results {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
@@ -254,7 +299,9 @@ fn lanes_sample_the_entry_their_index_names_when_scaled_in_the_loop() {
     ] {
         let shader = build(words, false);
         let results = sampled(&shader);
-        assert!(!results.is_empty());
+        if !device_ran(&results) {
+            return;
+        }
         for (label, red) in results {
             assert_eq!(red, want, "{label}");
         }
@@ -269,7 +316,9 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     for folded in [false, true] {
         let shader = build(&cmpx_waterfall(false, folded), false);
         let results = sampled(&shader);
-        assert!(!results.is_empty());
+        if !device_ran(&results) {
+            return;
+        }
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
@@ -292,7 +341,9 @@ fn lanes_sample_their_arm_after_a_redundant_masked_write() {
     );
     let shader = build(&words, false);
     let results = sampled(&shader);
-    assert!(!results.is_empty());
+    if !device_ran(&results) {
+        return;
+    }
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for (label, red) in results {
         assert_eq!(red, want, "{label}");
@@ -348,7 +399,9 @@ fn gather4_with_a_level_returns_the_four_texels_of_that_level_in_gather_order() 
         View::RawUav(32),
     ];
     let results = run(&shader, &views);
-    assert!(!results.is_empty());
+    if !device_ran(&results) {
+        return;
+    }
     for (label, words) in results {
         let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
         // u * 4 - 0.5 = 1: texels (1, 2), (2, 2), (2, 1), (1, 1).
@@ -385,10 +438,222 @@ fn gather4_with_a_level_far_outside_the_view_reads_the_nearest_edge() {
             View::RawUav(32),
         ];
         let results = run(&shader, &views);
-        assert!(!results.is_empty());
+        if !device_ran(&results) {
+            return;
+        }
         for (label, words) in results {
             let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
             assert_eq!(got, vec![texel; 32], "{label}: ({u}, {v})");
+        }
+    }
+}
+
+#[test]
+fn explicit_cube_gradients_select_face_and_mip() {
+    // Six faces, split into four groups of lanes with different derivatives.
+    // At width 8, ds/dx of 1/4 chooses mip 1; dt/dy of 1/2 or 1 chooses mip 2 or 3.
+    let setup = [
+        0xbe84_0300, // s_mov_b32 s4, s0
+        0xbe85_0380, // s_mov_b32 s5, 0
+        0xbe86_0301, // s_mov_b32 s6, s1
+        0xbe87_0380, // s_mov_b32 s7, 0
+        0xf40c_0302,
+        0xfa00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xf408_0a02,
+        0xfa00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xf408_0203,
+        0xfa00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x3604_0087, // v_and_b32_e32 v2, 7, v0
+        0x2604_0485, // v_min_u32_e32 v2, 5, v2
+        0x7e14_0d02, // v_cvt_f32_u32_e32 v10, v2
+        0x2c06_0083, // v_lshrrev_b32_e32 v3, 3, v0
+        0x3608_0681, // v_and_b32_e32 v4, 1, v3
+        0x7e08_0d04, // v_cvt_f32_u32_e32 v4, v4
+        0x1008_08ff,
+        0x3e80_0000, // v_mul_f32_e32 v4, 0x3e800000, v4
+        0x7e0a_0280, // v_mov_b32_e32 v5, 0
+        0x7e0c_0280, // v_mov_b32_e32 v6, 0
+        0x2c0e_0681, // v_lshrrev_b32_e32 v7, 1, v3
+        0x340e_0f03, // v_lshlrev_b32_e32 v7, v3, v7 (0, 0, 4, 8)
+        0x7e0e_0d07, // v_cvt_f32_u32_e32 v7, v7
+        0x100e_0eff,
+        0x3e00_0000, // v_mul_f32_e32 v7, 0.125, v7
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    ];
+    let ordinary = [
+        0x7e10_02ff,
+        0x3fc0_0000, // v8 = 1.5
+        0x7e12_02ff,
+        0x3fc0_0000, // v9 = 1.5
+        0xf088_0118,
+        0x0043_0c04, // image_sample_d v12, v[4:10], s[12:19], s[8:11], cube
+    ];
+    let packed = [
+        0x7e10_02ff,
+        0x3e00_3e00, // s and t packed into v8
+        0x7e12_150a, // v_cvt_f16_f32 v9, v10 (face)
+        0x3812_12f4, // v_or_b32 v9, 0x40000000, v9 (minimum LOD 2)
+        0xf08c_0118,
+        0x4043_0c04, // image_sample_d_cl v12, v[4:9], s[12:19], s[8:11], cube a16
+    ];
+    // The low and high halves hold ds and dt, respectively, for each axis.
+    let half_gradients = [
+        0x7e08_1504, // write ds/dx to low half of v4
+        0x3608_08ff,
+        0x0000_ffff, // clear preserved high half (dt/dx)
+        0x7e0a_1507, // v5 = f16(dt/dy)
+        0x340a_0a90, // v5 <<= 16; ds/dy = 0
+    ];
+    let g16 = [
+        0x7e0c_02ff,
+        0x3fc0_0000, // v6 = s
+        0x7e0e_02ff,
+        0x3fc0_0000, // v7 = t
+        0x7e10_030a, // v8 = face
+        0xf088_0119,
+        0x0043_0c04, // image_sample_d_g16, cube
+    ];
+    let g16_a16 = [
+        0x7e0c_02ff,
+        0x3e00_3e00, // v6 = packed s and t
+        0x7e0e_0280, // clear both halves before packing face and minimum LOD
+        0x7e0e_150a, // v7 = f16(face)
+        0x380e_0ef4, // high half of v7 = minimum LOD 2
+        0xf08c_0119,
+        0x4043_0c04, // image_sample_d_cl_g16, cube a16
+    ];
+    let store = [0xe070_1000, 0x800a_0c10, 0xbf81_0000]; // store v12 at v16, then end
+    let mut texels = Vec::new();
+    for face in 0..6 {
+        for mip in 0..4 {
+            let size = 8 >> mip;
+            texels.extend(std::iter::repeat_n(
+                [(face * 10 + mip) as f32; 4],
+                size * size,
+            ));
+        }
+    }
+    let views = [
+        View::Cube(8, 4, &texels),
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::RawUav(32),
+    ];
+    for (gradients, sample, min_lod) in [
+        (&[][..], &ordinary[..], 0),
+        (&[][..], &packed[..], 2),
+        (&half_gradients[..], &g16[..], 0),
+        (&half_gradients[..], &g16_a16[..], 2),
+    ] {
+        let words = [&setup[..], gradients, sample, &store[..]].concat();
+        let (shader, _) = build_any(&words, false);
+        let expected: Vec<_> = (0..32)
+            .map(|lane| {
+                let face = (lane % 8).min(5);
+                let mip = [0, 1, 2, 3][lane / 8].max(min_lod);
+                ((face * 10 + mip) as f32).to_bits()
+            })
+            .collect();
+        let results = run(&shader, &views);
+        if !device_ran(&results) {
+            return;
+        }
+        for (backend, readback) in results {
+            assert_eq!(readback, expected, "{backend}, minimum LOD {min_lod}");
+            eprintln!("{backend}: all 32 face and mip values matched at minimum LOD {min_lod}");
+        }
+    }
+}
+
+#[test]
+fn scalar_structured_load_and_record_count_use_the_same_view() {
+    #[rustfmt::skip]
+    let words = [
+        0xbe840300, 0xbe850380,     // s[4:5] = view table
+        0xf4080202, 0xfa000000,     // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xf4080302, 0xfa000040,     // s_load_dwordx4 s[12:15], s[4:5], 64
+        0xf4200404, 0xfa000014,     // s_buffer_load_dword s16, s[8:11], 20
+        0x80110a10,                 // s_add_u32 s17, s16, s10 (record count)
+        0x7e020211,                 // v_mov_b32 v1, s17
+        0x34040082,                 // v_lshlrev_b32 v2, 2, v0 (lane * 4)
+        0xe0701000, 0x80030102,     // buffer_store_dword v1, v2, s[12:15], 0 offen
+        0xbf810000,                 // s_endpgm
+    ];
+    // The second program uses descriptor word 2 only as the byte offset
+    // of the scalar buffer load that also consumes the whole descriptor.
+    let mut offset_words = words;
+    offset_words[7] = 0x14000000; // soffset = s10, immediate offset = 0
+    offset_words[8] = 0xbe910310; // s_mov_b32 s17, s16
+    let (sum, _) = build_with_view(&words, Some(16));
+    let (offset, _) = build_with_view(&offset_words, Some(16));
+    for records in [4, 8] {
+        let mut data = vec![0u32; records * 4];
+        data[1] = 0x1234;
+        data[2] = 0x5678;
+        data[5] = 0x9012;
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Structured(16),
+            },
+            View::Texture(1, 1, &[[0.0; 4]]),
+            View::RawUav(32),
+        ];
+        for (shader, expected) in [
+            (&sum, data[5] + records as u32),
+            (&offset, data[records / 4]),
+        ] {
+            let results = run(shader, &views);
+            if !device_ran(&results) {
+                return;
+            }
+            for (label, result) in results {
+                assert_eq!(result, vec![expected; 32], "{label}");
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_buffer_load_keeps_unwritten_high_half() {
+    // VIC-BT-015: buffer_load_format_d16_x/xyz keep vdst[31:16] on the
+    // trailing VGPR; a full pair replaces the whole dword.
+    let data = [1.0f32, 2.0, 3.0, 4.0].map(f32::to_bits);
+    let buffer = || View::Buffer {
+        data: &data,
+        stride: Stride::Typed,
+    };
+    let views = [buffer(), buffer(), View::RawUav(32)];
+    for (opcode, reg, seed, want) in [
+        (0u32, 12u32, 0x5a5a_1234u32, 0x5a5a_3c00u32),
+        (1, 12, 0x5a5a_1234, 0x4000_3c00),
+        (2, 13, 0xdead_5678, 0xdead_4200),
+    ] {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xF408_0302,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E00_02FF | reg << 17,
+            seed, // v_mov_b32 v[reg], seed
+            0xE200_2000 | opcode << 18,
+            0x8003_0C02, // buffer_load_format_d16_* v12..., v2, s[12:15], 0 idxen
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xE070_1000,
+            0x800A_0010 | reg << 8, // buffer_store_dword v[reg], v16, s[40:43], 0 offen
+            0xBF81_0000,            // s_endpgm
+        ];
+        let (shader, lowered) = build_any(&words, true);
+        assert_eq!(lowered.nonuniform_handles, 0);
+        assert_eq!(lowered.d16_kept_high_halves, u32::from(opcode != 1));
+        let results = run(&shader, &views);
+        if !device_ran(&results) {
+            return;
+        }
+        for (backend, got) in results {
+            assert_eq!(got, vec![want; 32], "{backend}: {} channels", opcode + 1);
         }
     }
 }

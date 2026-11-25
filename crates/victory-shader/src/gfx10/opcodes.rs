@@ -358,6 +358,8 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x01f, "v_mac_f32"),
     (0x020, "v_madmk_f32"),
     (0x021, "v_madak_f32"),
+    // GFX8/GFX9 only in Mesa; Scarlett titles still emit it (VIC-BT-042).
+    (0x023, "v_mac_f16"),
     (0x025, "v_add_nc_u32"),
     (0x026, "v_sub_nc_u32"),
     (0x027, "v_subrev_nc_u32"),
@@ -713,6 +715,8 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x176, "v_mad_u64_u32"),
     (0x177, "v_mad_i64_i32"),
     (0x178, "v_xor3_b32"),
+    // GFX9 opcode (Mesa); not in the public GFX10 column, but titles emit it.
+    (0x203, "v_mad_f16"),
     (0x2ff, "v_lshlrev_b64"),
     (0x300, "v_lshrrev_b64"),
     (0x301, "v_ashrrev_i64"),

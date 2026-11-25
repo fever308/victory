@@ -34,6 +34,10 @@ pub type HRESULT = i32;
 pub const S_OK: HRESULT = 0;
 /// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
 pub const NOT_SUPPORTED: HRESULT = 0x8007_0032_u32 as i32;
+/// `E_NOINTERFACE`.
+pub const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+/// `E_POINTER`.
+pub const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +59,9 @@ impl Guid {
     }
 }
 
+/// `IUnknown` (`00000000-0000-0000-C000-000000000046`).
+pub const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+
 impl std::fmt::Display for Guid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let d = self.data4;
@@ -67,22 +74,34 @@ impl std::fmt::Display for Guid {
 }
 
 /// A runtime object as title code calls it: its first word points at the
-/// method table. Ours are static, so reference counting is a no-op.
+/// method table. Ours are static, so reference counting is a no-op unless
+/// an `Instance` wraps this header with its own count.
 #[repr(C)]
 pub struct Object {
     vtable: *const *const (),
     /// Named in the log when a title calls a method we lack.
     area: &'static str,
+    /// Interface ids this object answers besides [`IID_IUNKNOWN`].
+    iids: &'static [Guid],
 }
 
-// SAFETY: the table is a static array of function addresses.
+// SAFETY: the table is a static array of function addresses; `iids` is static.
 unsafe impl Sync for Object {}
 
 impl Object {
     pub const fn new<const N: usize>(area: &'static str, methods: &'static Methods<N>) -> Object {
+        Object::with_iids(area, methods, &[])
+    }
+
+    pub const fn with_iids<const N: usize>(
+        area: &'static str,
+        methods: &'static Methods<N>,
+        iids: &'static [Guid],
+    ) -> Object {
         Object {
             vtable: methods.0.as_ptr(),
             area,
+            iids,
         }
     }
 }
@@ -115,6 +134,46 @@ const AREAS: &[&[Interface]] = &[
 /// `AddRef` and `Release`.
 pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
+}
+
+/// Slot 0: `QueryInterface`. A null `out` or `iid` is `E_POINTER`;
+/// [`IID_IUNKNOWN`] and the object's registered ids succeed (`AddRef`,
+/// `S_OK`); anything else clears `*out` and returns `E_NOINTERFACE`.
+///
+/// `AddRef` is taken from vtable slot 1 so the same helper works for a
+/// static [`Object`] and for an `Instance` whose first word is this header.
+pub extern "system" fn query_interface(
+    this: *mut Object,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if this.is_null() || iid.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(std::ptr::null_mut()) };
+        return E_POINTER;
+    }
+    // SAFETY: title code calls methods on objects we handed out; iid is readable.
+    let (object, iid) = unsafe { (&*this, *iid) };
+    let found = iid == IID_IUNKNOWN || object.iids.contains(&iid);
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe {
+        out.write(if found {
+            this.cast()
+        } else {
+            std::ptr::null_mut()
+        });
+    }
+    if !found {
+        return E_NOINTERFACE;
+    }
+    type AddRef = extern "system" fn(*mut Object) -> u32;
+    // SAFETY: every Object's table has AddRef at slot 1.
+    let add_ref: AddRef = unsafe { std::mem::transmute(*object.vtable.add(1)) };
+    add_ref(this);
+    S_OK
 }
 
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot
@@ -490,12 +549,13 @@ mod tests {
     }
 
     static TEST_METHODS: Methods<4> = Methods([
-        missing::<0> as *const (),
+        query_interface as *const (),
         add_ref as *const (),
         answer as *const (),
         missing::<3> as *const (),
     ]);
-    static TEST_OBJECT: Object = Object::new("test", &TEST_METHODS);
+    const TEST_IID: Guid = Guid::new(0x1111_1111, 0x2222, 0x3333, [4; 8]);
+    static TEST_OBJECT: Object = Object::with_iids("test", &TEST_METHODS, &[TEST_IID]);
 
     #[test]
     fn an_object_points_at_its_method_table() {
@@ -509,12 +569,36 @@ mod tests {
         assert_eq!(add_ref(std::ptr::null()), 1);
         let not_implemented = xasync::E_NOTIMPL as u32;
         assert_eq!(
-            method::<Slot>(&TEST_OBJECT, 0x00)(&TEST_OBJECT),
-            not_implemented
-        );
-        assert_eq!(
             method::<Slot>(&TEST_OBJECT, 0x18)(&TEST_OBJECT),
             not_implemented
+        );
+    }
+
+    #[test]
+    fn query_interface_accepts_iunknown_and_registered_iids() {
+        type Qi = extern "system" fn(*mut Object, *const Guid, *mut *mut c_void) -> HRESULT;
+        let qi = method::<Qi>(&TEST_OBJECT, 0x00);
+        let this = std::ptr::from_ref(&TEST_OBJECT).cast_mut();
+        let mut out: *mut c_void = std::ptr::null_mut();
+
+        assert_eq!(qi(this, &IID_IUNKNOWN, &mut out), S_OK);
+        assert_eq!(out, this.cast());
+        out = std::ptr::null_mut();
+        assert_eq!(qi(this, &TEST_IID, &mut out), S_OK);
+        assert_eq!(out, this.cast());
+
+        let unknown = Guid::new(0xdead_beef, 0, 0, [0; 8]);
+        out = 0x1234 as *mut c_void;
+        assert_eq!(qi(this, &unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+
+        out = 0x1234 as *mut c_void;
+        assert_eq!(qi(this, std::ptr::null(), &mut out), E_POINTER);
+        assert!(out.is_null());
+        assert_eq!(
+            qi(this, &IID_IUNKNOWN, std::ptr::null_mut()),
+            E_POINTER,
+            "a null out pointer is E_POINTER without a write"
         );
     }
 

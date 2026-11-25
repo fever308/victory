@@ -13,11 +13,18 @@ fn main() {
     };
     println!("cargo:rerun-if-changed={}", compiler.display());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    for name in ["argument_clamp", "rect_rewrite", "rect_expand"] {
+    for (name, entry, profile) in [
+        ("argument_clamp", "main", "cs_6_0"),
+        ("rect_rewrite", "main", "cs_6_0"),
+        ("rect_expand", "main", "cs_6_0"),
+        ("plane_corners", "corner", "vs_6_0"),
+        ("plane_steps", "plane", "ps_6_0"),
+        ("plane_floats", "plane", "ps_6_0"),
+    ] {
         let source = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={source}");
         let status = Command::new(&compiler)
-            .args(["-T", "cs_6_0", "-E", "main", "-O3", "-Fo"])
+            .args(["-T", profile, "-E", entry, "-O3", "-Fo"])
             .arg(out.join(format!("{name}.dxil")))
             .arg(&source)
             .status()

@@ -1,5 +1,5 @@
-//! Everything specific to the title: its container formats, build
-//! identities, and the hooks we place in its code (located by per-build
+//! Everything specific to the title: its container formats and build
+//! identities. Per-build code hooks live in `victory-loader` (located by
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 

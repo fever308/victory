@@ -4,9 +4,10 @@
 //! the import, then list it with `hle_export!` in the module's `module()`.
 //! Run `victory census` over your titles to see what is still missing.
 //!
-//! Planned areas (driven by census results, not by completeness):
-//! `file` (package paths), `thread` (TLS callbacks for title threads),
-//! `xaudio2`, `xstore` stubs.
+//! Package paths (`files`), store answers (`xstore`), and audio (`audio`,
+//! `dsp`, Windows `apu`) are implemented. shortcut: title-thread TLS
+//! callbacks and a full XAudio2 surface are still driven by census, not by
+//! completeness.
 
 #[cfg(windows)]
 pub mod apu;

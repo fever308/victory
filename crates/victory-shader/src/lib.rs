@@ -11,6 +11,7 @@
 // collide at link time.
 #[cfg(test)]
 pub mod agility;
+pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
@@ -21,7 +22,7 @@ pub mod native;
 pub mod resource;
 pub mod structure;
 
-pub use dxbc::{Container, FourCC, Part};
+pub use dxbc::{Container, DispatchInfo, FourCC, Fspx, Part, inspect_fspx};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,

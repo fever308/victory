@@ -1,6 +1,6 @@
 # VIctory
 
-*Read this in: [English](../README.md)*
+*Read this in: [English](../README.md) | [Português](../README.pt-BR.md) | [Bahasa Indonesia](README.id.md)*
 
 Menjalankan sebuah judul Xbox Series X|S secara native di Windows, dari file yang disediakan oleh pengguna.
 

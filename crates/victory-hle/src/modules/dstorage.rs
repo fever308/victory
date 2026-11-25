@@ -30,7 +30,9 @@ use windows_sys::Win32::Foundation::HANDLE;
 
 use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
-use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
+use super::xgameruntime::{
+    Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put, query_interface,
+};
 use crate::{HleModule, hle_export};
 
 mod errors;
@@ -52,7 +54,7 @@ const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
 
 type Out = *mut *mut c_void;
 
-static FACTORY_OBJECT: Object = Object::new("dstorage factory", &FACTORY_VTABLE);
+static FACTORY_OBJECT: Object = Object::with_iids("dstorage factory", &FACTORY_VTABLE, &[FACTORY]);
 
 pub extern "system" fn DStorageGetFactory(iid: *const Guid, out: Out) -> HRESULT {
     // SAFETY: the title passes a GUID (null tolerated).
@@ -121,7 +123,9 @@ type Factory = *const Object;
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
-    const FILE_SHARE_READ: u32 = 1;
+    // Match typical archive readers: allow others to write/delete while we
+    // read, and capture LastError before any allocation (VIC-BT-037 / #440).
+    const FILE_SHARE_ALL: u32 = 0x7; // READ | WRITE | DELETE
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
@@ -130,23 +134,29 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_ALL,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
         std::ptr::null_mut(),
     );
+    if handle as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: the title passes a NUL-terminated path.
+        let filename = unsafe {
+            let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+            std::slice::from_raw_parts(path, len)
+        };
+        let name = String::from_utf16_lossy(filename);
+        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+        return from_win32(&error);
+    }
     // SAFETY: the title passes a NUL-terminated path.
     let filename = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
     };
     let name = String::from_utf16_lossy(filename);
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-        return from_win32(&error);
-    }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
@@ -254,7 +264,7 @@ fn text(name: *const c_char) -> String {
 }
 
 static FACTORY_VTABLE: Methods<16> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),            // 0x18 (2020: queue creation)
@@ -280,7 +290,7 @@ struct File {
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref_instance::<File> as *const (),
     release::<File> as *const (),
     missing::<3> as *const (),
@@ -315,7 +325,7 @@ extern "system" fn is_complete(this: Array, index: u32) -> bool {
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref_instance::<StatusArray> as *const (),
     release::<StatusArray> as *const (),
     is_complete as *const (),   // 0x18
@@ -1054,8 +1064,8 @@ fn into_destination(
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+    if let Some(window) = super::xmem::page_window(pages, offset, len) {
+        return window.fill(fill);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1069,7 +1079,7 @@ fn into_destination(
 /// Slots by the 2020 order, which the argument shapes at the
 /// title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
     enqueue_request as *const (),       // 0x18
@@ -1101,7 +1111,7 @@ mod tests {
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     use super::*;
-    use crate::modules::xgameruntime::method;
+    use crate::modules::xgameruntime::{E_POINTER, IID_IUNKNOWN, method};
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.
@@ -1244,6 +1254,49 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    #[test]
+    fn factory_query_interface_accepts_iunknown_and_factory_iid() {
+        type Qi = extern "system" fn(*mut c_void, *const Guid, Out) -> HRESULT;
+        let factory = factory();
+        let qi: Qi = call(factory, 0x00);
+        let mut out = std::ptr::null_mut();
+        assert_eq!(qi(factory, &IID_IUNKNOWN, &mut out), S_OK);
+        assert_eq!(out, factory);
+        out = std::ptr::null_mut();
+        assert_eq!(qi(factory, &FACTORY, &mut out), S_OK);
+        assert_eq!(out, factory);
+
+        let unknown = Guid::new(0xdead_beef, 0, 0, [0; 8]);
+        out = 0x1234 as *mut c_void;
+        assert_eq!(qi(factory, &unknown, &mut out), E_NOINTERFACE);
+        assert!(out.is_null());
+        out = 0x1234 as *mut c_void;
+        assert_eq!(qi(factory, std::ptr::null(), &mut out), E_POINTER);
+        assert!(out.is_null());
+        assert_eq!(qi(factory, &IID_IUNKNOWN, std::ptr::null_mut()), E_POINTER);
+    }
+
+    #[test]
+    fn queue_query_interface_accepts_iunknown_and_addrefs() {
+        type Qi = extern "system" fn(*mut c_void, *const Guid, Out) -> HRESULT;
+        let queue = new_queue(0);
+        // SAFETY: `new_queue` returns an `Instance<Queue>` we still own.
+        let refs_before = unsafe { &*queue.cast::<Instance<Queue>>() }
+            .refs
+            .load(Ordering::Relaxed);
+        let qi: Qi = call(queue, 0x00);
+        let mut out = std::ptr::null_mut();
+        assert_eq!(qi(queue, &IID_IUNKNOWN, &mut out), S_OK);
+        assert_eq!(out, queue);
+        // SAFETY: as above; QI AddRef'd through the instance's slot.
+        let refs_after = unsafe { &*queue.cast::<Instance<Queue>>() }
+            .refs
+            .load(Ordering::Relaxed);
+        assert_eq!(refs_after, refs_before + 1);
+        void(queue, 0x10); // Release the QI retain
+        void(queue, 0x10); // Release the create retain
     }
 
     #[test]

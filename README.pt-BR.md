@@ -1,7 +1,9 @@
 # VIctory
 
-> Tradução do [README.md](README.md) em inglês, feita em 2026-11-23. Em caso de
+> Tradução do [README.md](README.md) em inglês, atualizada em 2026-11-25. Em caso de
 > divergência, vale a versão em inglês.
+
+*Leia em: [English](README.md) | [Português](README.pt-BR.md) | [Bahasa Indonesia](languages/README.id.md)*
 
 Roda um título de Xbox Series X|S nativamente no Windows, a partir de
 arquivos fornecidos pelo próprio usuário.
@@ -40,7 +42,7 @@ O que cada parte faz hoje e o que ainda falta:
 | Rede | Offline por projeto: o jogo não consegue acessar a rede | – |
 | Arquivos e streaming | Leitura de arquivos compactados e dados em streaming, decodificação zlib e BCPack em paralelo | O carregamento é limitado pelas escritas na memória do jogo |
 | Entrada | Controles XInput, teclado, teclado simulando controle | Vibração dos gatilhos |
-| Áudio | Som de menu, vídeo e carregamento; vozes XMA e streams Opus decodificam | O reverb está mudo; resultados do Opus não conferidos com o jogo |
+| Áudio | Som de menu, vídeo e carregamento; vozes XMA e streams Opus decodificam; reverb por convolução está molhado | Transformadas FFT/IFFT do DSP ficam mudas; resultados do Opus não conferidos com o jogo |
 | GPU: menus | Draws, compute e apresentação no D3D12 do host; só a memória do jogo que mudou é copiada | O ritmo dos quadros oscila em uma tela nos builds de release |
 | GPU: mundo | Pipelines de mesh, buffers escritos por shaders, tempo de vida de descritores, execução indireta (argumentos limitados), pipelines criados por threads de trabalho e guardados em disco | A maior parte da cena ainda falta (shaders não traduzidos descartam draws); quadros levam segundos; faltam queries reais, depth bounds, HDR e escala |
 | Shaders | Código de GPU do console recompilado para DXIL no primeiro uso, em cache no disco. Menus: todos. Mundo: mesh 8.191 de 8.506, vertex/pixel 10.617 de 12.346, compute 1.643 de 2.539 | Atomics de imagem de 64 bits, estágios de geometria mesclados, os shaders do construtor de ray tracing; alguns programas de compute precisam de GPU com waves de 64 lanes |
@@ -134,6 +136,14 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | loops de shaders traduzidos param após `n` iterações por lane em vez de 2^20 (com entradas próprias no cache de shaders); se um `n` menor deixar os quadros do mundo bem mais rápidos, são os loops que atingem o limite que causam a lentidão |
 | `VICTORY_AUDIO_CAPTURE=<arquivo.wav>` | grava o que o jogo toca (só o nosso processo) |
 | `VICTORY_XMA_DUMP=<dir>` | salva o contexto e a entrada das primeiras 32 vozes XMA |
+| `VICTORY_NO_WATCHDOG=1` | aplica os hooks opcionais que desarmam o watchdog do título (Series 1.0.2.1) |
+| `VICTORY_SKIP_CPU_CHECK=1` | pula a verificação AVX2 antes de `--execute` (emuladores de CPU como Intel SDE) |
+| `VICTORY_PAD_LOG=1` | registra descoberta e reports de DualSense / HID |
+| `VICTORY_COPY_MODE=plain` | copia memória de GPU do título sem o caminho com estatísticas da linha de FPS |
+| `VICTORY_WARP=1` | força o host dos testes de shader no WARP (distinto de `VICTORY_D3D12_WARP`) |
+| `VICTORY_SAVE_STOP=<n>` | auxiliar de teste: trava o processo no passo de save `n` |
+
+> A tabela completa de variáveis de diagnóstico está no [README em inglês](README.md); esta cópia pode ficar atrás.
 
 Todo build acrescenta crashes e falhas de GPU do host ao `crashes.log` na
 pasta de dados do jogo.

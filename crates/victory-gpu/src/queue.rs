@@ -178,6 +178,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             let in_flight = std::mem::take(batch);
             timeline.submit(Op::Run(Box::new(move || {
                 if let Some(host) = crate::host::host() {
+                    crate::descriptor::sync_all_heaps();
                     let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
                     host.execute(&runs);
                     for entry in in_flight {

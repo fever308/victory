@@ -57,6 +57,10 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Why no presenter was made (or resized), and when to try again: a run
+    /// with no desktop to present on would otherwise ask DXGI at the frame
+    /// rate.
+    present_retry: Mutex<Retry>,
     /// Detached host lists whose submissions finished, ready to reuse.
     free_lists: Mutex<Vec<HostList>>,
     #[cfg(test)]
@@ -65,37 +69,143 @@ pub(crate) struct Host {
     d3d12_errors: std::sync::atomic::AtomicU64,
 }
 
+/// A presenter that could not be made, and when to try again. Without this,
+/// a run behind a locked screen or a sleeping display retried every frame:
+/// 1,654 `no swap chain` lines in 60 seconds, and one DXGI call per frame,
+/// which buries the log and costs a submission's worth of work each time.
+struct Retry {
+    attempts: u32,
+    /// The next attempt is due at (or after) this instant; `None` with
+    /// `attempts == 0` means nothing has failed.
+    next: Option<std::time::Instant>,
+}
+
+impl Retry {
+    const fn new() -> Self {
+        Retry {
+            attempts: 0,
+            next: None,
+        }
+    }
+
+    /// Whether an attempt is due at `now`.
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.next.is_none_or(|at| now >= at)
+    }
+
+    /// Records a failed attempt at `now` and when the next one may run.
+    fn failed(&mut self, now: std::time::Instant) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next = Some(now + retry_delay(self.attempts));
+    }
+
+    /// Clears the failure state after an attempt worked, returning how many
+    /// attempts had failed before it.
+    fn reset(&mut self) -> u32 {
+        let attempts = self.attempts;
+        *self = Retry::new();
+        attempts
+    }
+}
+
+/// How long to wait before retry number `attempts`: 100 ms, doubling, up to
+/// one second, so a state that clears still recovers within a second.
+fn retry_delay(attempts: u32) -> std::time::Duration {
+    const FIRST_MS: u64 = 100;
+    const MOST_MS: u64 = 1_000;
+    let doubling = FIRST_MS << attempts.saturating_sub(1).min(4);
+    std::time::Duration::from_millis(doubling.min(MOST_MS))
+}
+
+/// Which step of making a presenter failed, so the log says whether the
+/// window, the swap chain or its command list was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentStep {
+    Window,
+    Factory,
+    SwapChain,
+    List,
+}
+
+impl PresentStep {
+    fn name(self) -> &'static str {
+        match self {
+            PresentStep::Window => "window",
+            PresentStep::Factory => "DXGI factory",
+            PresentStep::SwapChain => "swap chain",
+            PresentStep::List => "copy list",
+        }
+    }
+}
+
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
 // free-threaded; the event handle is only waited on under `submitted`.
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-/// Warn once when a pinned epoch holds back this many retired host objects
+/// Warn once when pinned epochs hold back this many retired host objects
 /// (for example, an unreset command list or a submission stalled behind an
 /// unsignalled fence).
 const RETIRED_WARN_THRESHOLD: usize = 4096;
 
+/// Monotonic sequence bumped whenever a tracked host resource (`HostTexture`,
+/// `Shadow`, `Staging`) is created. Starts at 1 so `0` means "unbounded /
+/// existed before any sequence" (used by legacy [`retire`]).
+static RESOURCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Returns a strictly increasing birth sequence for a newly allocated host
+/// resource. Active command lists whose last recorded command occurred before
+/// this sequence cannot reference the resource and do not block its release.
+pub(crate) fn birth_seq() -> u64 {
+    RESOURCE_SEQ.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// Sentinel work sequence shared by active [`Host::execute`] submissions so
+/// any object retired while the GPU is executing stays alive until execution
+/// finishes.
+fn exec_work_seq() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    static SEQ: OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> = OnceLock::new();
+    SEQ.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)))
+        .clone()
+}
+
+struct ActiveEpoch {
+    /// Highest [`RESOURCE_SEQ`] observed when this epoch's owner recorded work
+    /// (or `u64::MAX` for an active [`Host::execute`] submission).
+    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Slab indices in [`RetireState::retired`] waiting on this epoch.
+    waiting: Vec<usize>,
+}
+
+struct RetiredEntry {
+    remaining: usize,
+    object: Option<Retired>,
+}
+
 /// Host objects the title let go of while an open list or a queued/running
 /// submission may still use them (a texture its descriptors name, a descriptor
-/// slot's old resource, a buffer shadow, or texture staging), by the highest
-/// epoch that existed when they were retired. The title's descriptor writes and
-/// releases reach the host at once, from its own threads, while lists are
-/// recorded or submissions run for most of a second in the world: freeing there
-/// was a GPU page fault on the freed texture (DXGI_ERROR_DEVICE_HUNG,
-/// 2026-11-24, RX 7600).
+/// slot's old resource, a buffer shadow, or texture staging). The title's
+/// descriptor writes and releases reach the host at once, from its own threads,
+/// while lists are recorded or submissions run for most of a second in the
+/// world: freeing there was a GPU page fault on the freed texture
+/// (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, RX 7600).
 ///
-/// Any stuck pinned epoch (such as a list that recorded GPU work and is never
-/// reset, or a submission waiting behind a fence that never signals) pins all
-/// later retirements until it is released; a one-time warning is logged once
-/// the queue reaches [`RETIRED_WARN_THRESHOLD`].
+/// Each retired object tracks only the specific active epochs whose recorded
+/// `work_seq` is at or after the object's `born_seq` (or all active epochs when
+/// `born_seq == 0`). When an epoch finishes, only the objects waiting on it
+/// decrement their blocker count and drop when it hits zero — avoiding global
+/// head-of-line blocking when an older unreset list or stalled wait stays
+/// pinned while newer resources are created and freed.
 ///
 /// Lock invariant: `RETIRE_STATE` is a strict leaf lock — never lock anything
 /// else while holding it, and ALWAYS drop retired objects AFTER releasing it.
 struct RetireState {
     next_epoch: u64,
-    active_epochs: std::collections::BTreeMap<u64, usize>,
-    retired: std::collections::VecDeque<(u64, Retired)>,
+    active_epochs: std::collections::BTreeMap<u64, ActiveEpoch>,
+    retired: Vec<Option<RetiredEntry>>,
+    free_slots: Vec<usize>,
+    pending_count: usize,
     warned: bool,
 }
 
@@ -104,7 +214,9 @@ impl RetireState {
         Self {
             next_epoch: 1,
             active_epochs: std::collections::BTreeMap::new(),
-            retired: std::collections::VecDeque::new(),
+            retired: Vec::new(),
+            free_slots: Vec::new(),
+            pending_count: 0,
             warned: false,
         }
     }
@@ -150,7 +262,8 @@ pub(crate) fn isolated_retire_scope() -> RetireTestScope {
     RetireTestScope { prev }
 }
 
-/// A retired object, dropped on whatever thread finishes the blocking epoch.
+/// A retired object, dropped on whatever thread finishes its last blocking
+/// epoch.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
@@ -158,11 +271,20 @@ unsafe impl Send for Retired {}
 
 /// Acquires a monotonically increasing epoch (never 0) that keeps retired
 /// objects alive until [`release_epoch_in`] is called with it.
-fn acquire_epoch_in(retire_state: &Mutex<RetireState>) -> u64 {
+fn acquire_epoch_in(
+    retire_state: &Mutex<RetireState>,
+    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> u64 {
     let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
     let e = state.next_epoch;
     state.next_epoch += 1;
-    *state.active_epochs.entry(e).or_default() += 1;
+    state.active_epochs.insert(
+        e,
+        ActiveEpoch {
+            work_seq,
+            waiting: Vec::new(),
+        },
+    );
     e
 }
 
@@ -174,24 +296,21 @@ fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
     }
     let done: Vec<Retired> = {
         let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-        if let std::collections::btree_map::Entry::Occupied(mut entry) =
-            state.active_epochs.entry(epoch)
-        {
-            if *entry.get() <= 1 {
-                entry.remove();
-            } else {
-                *entry.get_mut() -= 1;
-            }
-        }
-        let min_active = state.active_epochs.keys().next().copied();
+        let Some(active) = state.active_epochs.remove(&epoch) else {
+            return;
+        };
         let mut done = Vec::new();
-        while let Some(&(wait_for, _)) = state.retired.front() {
-            if min_active.is_none_or(|min| min > wait_for) {
-                if let Some((_, item)) = state.retired.pop_front() {
-                    done.push(item);
+        for idx in active.waiting {
+            if let Some(entry) = state.retired.get_mut(idx).and_then(Option::as_mut) {
+                entry.remaining -= 1;
+                if entry.remaining == 0 {
+                    if let Some(obj) = entry.object.take() {
+                        done.push(obj);
+                    }
+                    state.retired[idx] = None;
+                    state.free_slots.push(idx);
+                    state.pending_count = state.pending_count.saturating_sub(1);
                 }
-            } else {
-                break;
             }
         }
         done
@@ -199,34 +318,71 @@ fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
     drop(done);
 }
 
-fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T) {
+fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T, born_seq: u64) {
     let warn = {
         let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.active_epochs.is_empty() {
+        let slot = state.free_slots.pop().unwrap_or(state.retired.len());
+        let mut blockers = 0usize;
+        for entry in state.active_epochs.values_mut() {
+            // Pairs with `AcqRel` `work_seq` updates in `HostList::mark_work`.
+            if born_seq == 0 || entry.work_seq.load(Ordering::Acquire) >= born_seq {
+                entry.waiting.push(slot);
+                blockers += 1;
+            }
+        }
+        if blockers == 0 {
+            if slot < state.retired.len() {
+                state.free_slots.push(slot);
+            }
             drop(state);
             drop(object);
             return;
         }
-        let wait_for = state.next_epoch.saturating_sub(1);
-        state
-            .retired
-            .push_back((wait_for, Retired(Box::new(object))));
-        if !state.warned && state.retired.len() >= RETIRED_WARN_THRESHOLD {
+        let item = Some(RetiredEntry {
+            remaining: blockers,
+            object: Some(Retired(Box::new(object))),
+        });
+        if slot == state.retired.len() {
+            state.retired.push(item);
+        } else {
+            state.retired[slot] = item;
+        }
+        state.pending_count += 1;
+        if !state.warned && state.pending_count >= RETIRED_WARN_THRESHOLD {
             state.warned = true;
+            let (oldest_epoch, oldest_work_seq) = state
+                .active_epochs
+                .iter()
+                .next()
+                .map_or((0, 0), |(&e, entry)| {
+                    (e, entry.work_seq.load(Ordering::Relaxed))
+                });
             Some((
-                state.retired.len(),
-                state.active_epochs.keys().next().copied().unwrap_or(0),
+                state.pending_count,
+                oldest_epoch,
+                oldest_work_seq,
+                RESOURCE_SEQ.load(Ordering::Relaxed),
                 state.active_epochs.len(),
-                wait_for,
+                state.next_epoch.saturating_sub(1),
             ))
         } else {
             None
         }
     };
-    if let Some((pending, oldest_epoch, active_epochs, latest_epoch)) = warn {
+    if let Some((
+        pending,
+        oldest_epoch,
+        oldest_work_seq,
+        current_seq,
+        active_epochs,
+        latest_epoch,
+    )) = warn
+    {
         tracing::warn!(
             pending,
             oldest_epoch,
+            oldest_work_seq,
+            current_seq,
             active_epochs,
             latest_epoch,
             "retired host resource queue grew past threshold; an unreset command list or stalled wait may be pinning epochs"
@@ -234,17 +390,21 @@ fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T) {
     }
 }
 
-/// Drops `object` once every epoch active now has finished: at once if none is.
-/// Note: a stuck pinned epoch (such as an unreset list with recorded work or a
-/// submission behind an unsignalled fence) holds back all later retirements
-/// until released.
-pub(crate) fn retire<T: 'static>(object: T) {
+/// Drops `object` once every active epoch that could have observed a resource
+/// born at `born_seq` (`work_seq >= born_seq`, or all active epochs when
+/// `born_seq == 0`) has finished: at once if none matches.
+pub(crate) fn retire_born<T: 'static>(object: T, born_seq: u64) {
     #[cfg(test)]
     if let Some(scope) = current_retire_scope() {
-        retire_in(&scope, object);
+        retire_in(&scope, object, born_seq);
         return;
     }
-    retire_in(&RETIRE_STATE, object);
+    retire_in(&RETIRE_STATE, object, born_seq);
+}
+
+/// Drops `object` once every epoch active now has finished: at once if none is.
+pub(crate) fn retire<T: 'static>(object: T) {
+    retire_born(object, 0);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -454,6 +614,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            present_retry: Mutex::new(Retry::new()),
             free_lists: Mutex::default(),
             #[cfg(test)]
             reused_lists: std::sync::atomic::AtomicU64::new(0),
@@ -587,6 +748,9 @@ pub(crate) struct HostList {
     /// re-sync only the textures touched since the previous draw instead of
     /// walking every resident bindless texture on RT switches or copies.
     dirty_resources: Mutex<Vec<usize>>,
+    /// The depth textures with colour twins the list uses
+    /// ([`HostList::twin_use`]).
+    twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// Memory handed out for the list's recording, kept until it is finished
@@ -609,6 +773,10 @@ pub(crate) struct HostList {
     /// Active retirement epoch pinned while this list has recorded work or is
     /// queued/executing (0 when idle).
     epoch: std::sync::atomic::AtomicU64,
+    /// Highest [`RESOURCE_SEQ`] observed when this list recorded work; shared
+    /// with [`RetireState`] while `epoch != 0` so newer resources are not
+    /// blocked by stale lists.
+    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Queued or executing submissions currently pinning this list.
     in_flight: std::sync::atomic::AtomicUsize,
     /// Serializes `in_flight` transitions with `epoch` updates so a concurrent
@@ -683,6 +851,354 @@ type States = std::collections::HashMap<
     ),
 >;
 
+/// What a list does with a depth texture that has a colour twin
+/// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
+/// in submission order, so a list cannot know which side an earlier list
+/// leaves behind: it notes which sides it uses as it finds them, and its
+/// prelude copies one side into the other at submission if that side is
+/// behind then. From its first use of a side on, the list knows.
+struct TwinUse {
+    /// The depth texture (the title resource's host copy) and its twin.
+    depth: std::sync::Arc<crate::resource::HostTexture>,
+    twin: std::sync::Arc<crate::resource::Twin>,
+    /// The sides (depth texture, twin) the list uses as it finds them.
+    needs: [bool; 2],
+    /// Whether each side lacks what the other was written last, where the
+    /// list is now; `None`: as the list found it.
+    behind: [Option<bool>; 2],
+    /// The draw or dispatch being prepared writes the twin.
+    writing: bool,
+    /// The depth plane's twin holds what the plane lacks although the list
+    /// copied the twins since: the plane's pass waits for the list's close.
+    late: bool,
+}
+
+/// Records into `list` the copy of a depth texture into its colour twin
+/// (`colour`) or of the twin into the depth texture, both already in their
+/// copy states.
+fn record_twin_copy(
+    list: &ID3D12GraphicsCommandList,
+    depth: &ID3D12Resource,
+    twin: &crate::resource::Twin,
+    colour: bool,
+) {
+    let (from, to) = if colour {
+        (depth, &twin.colour.texture)
+    } else {
+        (&twin.colour.texture, depth)
+    };
+    crate::resource::TWINS[2 + usize::from(colour)].fetch_add(1, Ordering::Relaxed);
+    // shortcut: the depth plane's twin is not given the plane (that is a
+    // pass the other way: the plane read by a shader, the twin as its
+    // target). The twin then lacks what draws and clears wrote to the
+    // plane since shaders last wrote the twin. In a title whose draws and
+    // clears only test the plane (192 draws, run 29), nothing writes it but
+    // the twin's pass, so the twin lacks nothing. Counted.
+    if colour && twin.plane.is_some() {
+        crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
+    }
+    let Some(through) = &twin.through else {
+        // SAFETY: an open list and two live textures.
+        unsafe { list.CopyResource(to, from) };
+        return;
+    };
+    // A stencil plane and its twin: each mip and slice of the plane goes
+    // into the buffer, laid out as the host lays the plane out for copies,
+    // and from the buffer into the other texture, whole subresources both
+    // times. In the depth texture the stencil plane's subresources follow
+    // the depth plane's; the twin has the one plane.
+    let Some(host) = host() else { return };
+    // SAFETY: a live texture.
+    let of = unsafe { depth.GetDesc() };
+    let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
+    let mut rows = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); planes as usize];
+    // SAFETY: a plain query writing `planes` footprints.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &of,
+            planes,
+            planes,
+            0,
+            Some(rows.as_mut_ptr()),
+            None,
+            None,
+            None,
+        );
+    }
+    let (first_from, first_to) = if colour { (planes, 0) } else { (0, planes) };
+    let subresource = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index,
+        },
+    };
+    let placed = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(through) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, source, dest) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live resources; the buffer was made as big
+    // as these footprints, and rests in the common state between copies.
+    unsafe {
+        list.ResourceBarrier(&[transition(through, common, dest)]);
+        for (i, row) in rows.iter().enumerate() {
+            let index = first_from + i as u32;
+            list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(from, index), None);
+        }
+        list.ResourceBarrier(&[transition(through, dest, source)]);
+        for (i, row) in rows.iter().enumerate() {
+            let index = first_to + i as u32;
+            list.CopyTextureRegion(&subresource(to, index), 0, 0, 0, &placed(row), None);
+        }
+        list.ResourceBarrier(&[transition(through, source, common)]);
+    }
+}
+
+/// The pass that draws the twin of a depth plane into the plane: one
+/// triangle over each mip of each slice, its pixel shader writing the
+/// twin's texel as the depth, with the depth test "always" and no stencil
+/// (the stencil plane is copied through a buffer and not touched here).
+///
+/// A 16-bit twin holds whole steps of 1/65535, and the depth written is
+/// the step times the float nearest 1/65535 (0x37800080). That is how a
+/// title's tiled lighting computes the depth of the rectangles it then
+/// draws with the test "equal", one class of materials
+/// a draw (all six of its vertex shaders multiply the class number by that
+/// constant), so the pass and the draw give the host the same float, and
+/// the host turns the same float into the same 24 bits. The step divided
+/// by 65535 is another float for 512 of the 65,536 steps (none under 257),
+/// and lands in another 24-bit step for 127 of them (none under 385).
+const PLANE_CORNERS: &str = include_str!("../shaders/plane_corners.hlsl");
+const PLANE_STEPS: &str = include_str!("../shaders/plane_steps.hlsl");
+const PLANE_FLOATS: &str = include_str!("../shaders/plane_floats.hlsl");
+
+/// Per kind of twin (16-bit steps or floats) and depth format the root signature
+/// and pipeline, made when first needed (`None`: the host refused).
+struct PlanePass {
+    made: Mutex<Vec<(bool, i32, Option<PlanePipeline>)>>,
+}
+
+/// The pass's root signature and pipeline for one kind of twin and one
+/// depth format.
+type PlanePipeline = (ID3D12RootSignature, ID3D12PipelineState);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for PlanePass {}
+// SAFETY: as above.
+unsafe impl Sync for PlanePass {}
+
+impl PlanePass {
+    /// The root signature and pipeline for a twin of 16-bit steps (`steps`)
+    /// or of floats and the depth format `format`.
+    fn pipeline(&self, steps: bool, format: DXGI_FORMAT) -> Option<PlanePipeline> {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, pipeline)) = made.iter().find(|m| (m.0, m.1) == (steps, format.0)) {
+            return pipeline.clone();
+        }
+        let pipeline = match Self::make(steps, format) {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    steps,
+                    format = format.0,
+                    "no pipeline to draw a depth plane from its twin: such planes stay as they are"
+                );
+                None
+            }
+        };
+        made.push((steps, format.0, pipeline.clone()));
+        pipeline
+    }
+
+    fn make(steps: bool, format: DXGI_FORMAT) -> windows::core::Result<PlanePipeline> {
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        // Through the helpers' compiler: the system's first, then DXC. Wine's
+        // `d3dcompiler_47` is the system compiler there, and what it refuses
+        // (`RWByteAddressBuffer` loads; these shaders use none today, their
+        // siblings do) DXC compiles.
+        let vs =
+            crate::hlsl::compile_stage("depth plane corners", PLANE_CORNERS, "corner", "vs_5_1")?;
+        let source = if steps { PLANE_STEPS } else { PLANE_FLOATS };
+        let ps = crate::hlsl::compile_stage("depth plane", source, "plane", "ps_5_1")?;
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        // SAFETY: the root signature is inside the pixel shader; the
+        // description points at live data and never releases its pointer.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                // Every texel is written; stencil stays off.
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: true.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                    DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                DSVFormat: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    }
+}
+
+/// Records into `list` the pass that draws `plane`, the twin of the depth
+/// plane of `depth`, into that plane: `depth` in the depth-write state,
+/// `plane` readable by pixel shaders. The pass sets the list's descriptor
+/// heap, root signature, pipeline, target and viewport: it runs only in a
+/// list that records nothing of the title's afterwards.
+fn record_plane_pass(
+    list: &ID3D12GraphicsCommandList,
+    depth: &ID3D12Resource,
+    plane: &ID3D12Resource,
+    plane_views: &OnceLock<Option<ID3D12DescriptorHeap>>,
+) {
+    static PASS: PlanePass = PlanePass {
+        made: Mutex::new(Vec::new()),
+    };
+    let Some(host) = host() else { return };
+    // SAFETY: live resources.
+    let (of, twin) = unsafe { (depth.GetDesc(), plane.GetDesc()) };
+    // An R16 typeless twin (53) holds steps, read as R16_UINT (57); an R32
+    // typeless one floats, read as R32_FLOAT (41). The depth view names
+    // the depth-stencil format of the texture's family (44: 45, 19: 20).
+    let steps = twin.Format.0 == 53;
+    let format = DXGI_FORMAT(match of.Format.0 {
+        44 => 45,
+        19 => 20,
+        typed => typed,
+    });
+    let Some((root, pipeline)) = PASS.pipeline(steps, format) else {
+        return;
+    };
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    // SAFETY: an immutable property of our live device.
+    let step = unsafe { host.device.GetDescriptorHandleIncrementSize(kind) };
+    let mips = u32::from(of.MipLevels);
+    let slices = u32::from(of.DepthOrArraySize);
+    let Some(views) = plane_views.get_or_init(|| {
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: kind,
+            NumDescriptors: mips * slices,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        };
+        // SAFETY: desc lives through creation and its count covers the entire texture.
+        let views: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc) }
+            .inspect_err(
+                |e| tracing::warn!(error = %e, "no descriptor heap for a depth plane twin"),
+            )
+            .ok()?;
+        // SAFETY: live, initialized heap.
+        let mut cpu = unsafe { views.GetCPUDescriptorHandleForHeapStart() };
+        for slice in 0..slices {
+            for mip in 0..mips {
+                let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(if steps { 57 } else { 41 }),
+                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                            MostDetailedMip: mip,
+                            MipLevels: 1,
+                            FirstArraySlice: slice,
+                            ArraySize: 1,
+                            ..Default::default()
+                        },
+                    },
+                };
+                // SAFETY: exactly one slot for every subresource; the heap is not published yet.
+                unsafe {
+                    host.device
+                        .CreateShaderResourceView(plane, Some(&view), cpu)
+                };
+                cpu.ptr += step as usize;
+            }
+        }
+        Some(views)
+    }) else {
+        return;
+    };
+    // SAFETY: this initialized, immutable heap remains live through the recording's execution.
+    let mut gpu = unsafe { views.GetGPUDescriptorHandleForHeapStart() };
+    for slice in 0..slices {
+        for mip in 0..mips {
+            let target = D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                        MipSlice: mip,
+                        FirstArraySlice: slice,
+                        ArraySize: 1,
+                    },
+                },
+                ..Default::default()
+            };
+            let target = host.dsv(depth, Some(&target));
+            let (width, height) = ((of.Width >> mip).max(1) as u32, (of.Height >> mip).max(1));
+            // SAFETY: an open list; a slot of our heap; live resources and
+            // objects (the pass's own live as long as the process).
+            unsafe {
+                list.SetDescriptorHeaps(&[Some(views.clone())]);
+                list.SetGraphicsRootSignature(&root);
+                list.SetPipelineState(&pipeline);
+                list.SetGraphicsRootDescriptorTable(0, gpu);
+                list.OMSetRenderTargets(0, None, false, Some(&target));
+                list.RSSetViewports(&[D3D12_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: width as f32,
+                    Height: height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]);
+                list.RSSetScissorRects(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                }]);
+                list.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4),
+                );
+                list.DrawInstanced(3, 1, 0, 0);
+            }
+            gpu.ptr += u64::from(step);
+            crate::resource::PLANES[0].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
 pub(crate) fn dred_on() -> bool {
@@ -750,9 +1266,12 @@ const RECT_ARGS_MIN: u64 = 64 << 10;
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
-    /// buffer copies, which later refreshes must see.
+    /// buffer copies, which later refreshes must see. Runs with
+    /// `title_dst = true` so unmapped title pages keep the commitment guard.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
+    /// A copy of title memory into the list's own upload memory. Runs with
+    /// `title_dst = false`: the destination is host-mapped, so Wine/vkd3d
+    /// `VirtualQuery` quirks must not skip it (#518).
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
@@ -799,8 +1318,8 @@ struct Deferred {
     /// address, bytes), and upload fills made since (destination, source,
     /// bytes): doing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    /// Most detailed mip this list has copied for each texture.
+    textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -810,16 +1329,6 @@ struct Deferred {
     copy_gen: u64,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
-}
-
-impl Deferred {
-    /// Whether a fill of upload memory at `dst` from title memory at `src`
-    /// (`len` bytes) is not yet among the steps since the last title copy
-    /// (and notes it). Kept with the refreshed ranges: both are forgotten
-    /// when a title copy may have changed their source.
-    fn first_fill(&mut self, dst: usize, src: usize, len: usize) -> bool {
-        self.refreshed.insert((dst, src, len))
-    }
 }
 
 impl Host {
@@ -967,6 +1476,7 @@ impl Host {
                 shadow_states: Mutex::default(),
                 state_gen: std::sync::atomic::AtomicU64::new(0),
                 dirty_resources: Mutex::default(),
+                twins: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 kept_uploads: Mutex::default(),
                 kept_dynamic: Mutex::default(),
@@ -974,6 +1484,7 @@ impl Host {
                 budget: OnceLock::new(),
                 rect_scratch: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(0),
+                work_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 in_flight: std::sync::atomic::AtomicUsize::new(0),
                 epoch_lock: Mutex::default(),
                 #[cfg(test)]
@@ -988,6 +1499,11 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // D3D12 requires NumCommandLists >= 1; an empty submission is a no-op
+        // (VIC-BT-035 / #440).
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1000,96 +1516,130 @@ impl Host {
         let exec_state: &Mutex<RetireState> = exec_scope.as_deref().unwrap_or(&RETIRE_STATE);
         #[cfg(not(test))]
         let exec_state: &Mutex<RetireState> = &RETIRE_STATE;
-        let exec_epoch = acquire_epoch_in(exec_state);
+        struct ExecEpochGuard<'a> {
+            state: &'a Mutex<RetireState>,
+            epoch: u64,
+        }
+        impl Drop for ExecEpochGuard<'_> {
+            fn drop(&mut self) {
+                release_epoch_in(self.state, self.epoch);
+            }
+        }
+        let exec_epoch = ExecEpochGuard {
+            state: exec_state,
+            epoch: acquire_epoch_in(exec_state, exec_work_seq()),
+        };
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
             for list in runs {
                 list.run_deferred(&mut batch);
-                firsts.push(lists.len());
-                if let Some(prelude) = list.prelude() {
-                    lists.push(Some(prelude));
-                }
-                lists.push(list.list.cast().ok());
             }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                match self.queue.Signal(&self.fence, *submitted) {
-                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            let waited = WaitForSingleObject(self.event, INFINITE);
-                            if waited != WAIT_OBJECT_0 {
+        // Each HostList owns one reusable prelude allocator/list. A submission
+        // may name the same list twice (queue segments, re-executes); calling
+        // prelude() again would Reset that allocator while the first recording
+        // is still queued. Split into batches where each pointer appears once,
+        // waiting between batches so the prelude can be re-recorded safely
+        // (VIC-BT-001 / #440).
+        let ptrs: Vec<usize> = runs
+            .iter()
+            .map(|list| std::ptr::from_ref(*list) as usize)
+            .collect();
+        for range in unique_list_batches(&ptrs) {
+            let batch_runs = &runs[range];
+            let mut lists: Vec<Option<ID3D12CommandList>> =
+                Vec::with_capacity(2 * batch_runs.len());
+            // Where each run's lists start in `lists`.
+            let mut firsts = Vec::with_capacity(batch_runs.len());
+            {
+                #[cfg(test)]
+                let _scope = enter_retire_scope(exec_scope.clone());
+                for list in batch_runs {
+                    firsts.push(lists.len());
+                    if let Some(prelude) = list.prelude() {
+                        lists.push(Some(prelude));
+                    }
+                    lists.push(list.list.cast().ok());
+                }
+            }
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+            #[cfg(feature = "diagnostics")]
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| &lists[a..b])
+                    .collect()
+            } else {
+                vec![&lists[..]]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [&lists[..]];
+            for (i, group) in groups.iter().enumerate() {
+                *submitted += 1;
+                let started = std::time::Instant::now();
+                // SAFETY: closed lists; the fence and event are ours. Prior
+                // batches have been waited for, so any reused prelude
+                // allocator is idle before the Reset inside prelude().
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    match self.queue.Signal(&self.fence, *submitted) {
+                        Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                            Ok(()) => {
+                                let waited = WaitForSingleObject(self.event, INFINITE);
+                                if waited != WAIT_OBJECT_0 {
+                                    tracing::warn!(
+                                        wait = waited.0,
+                                        "host fence event wait failed; polling fence"
+                                    );
+                                    self.poll_fence(*submitted);
+                                }
+                            }
+                            Err(e) => {
                                 tracing::warn!(
-                                    wait = waited.0,
-                                    "host fence event wait failed; polling fence"
+                                    error = %e,
+                                    "host fence event registration failed; polling fence"
                                 );
                                 self.poll_fence(*submitted);
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "host fence event registration failed; polling fence"
-                            );
-                            self.poll_fence(*submitted);
-                        }
-                    },
-                    Err(e) => fail(format_args!(
-                        "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
-                        runs.len(),
-                        self.removal_data(runs),
-                        last_notes(runs)
-                    )),
+                        },
+                        Err(e) => fail(format_args!(
+                            "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
+                            runs.len(),
+                            self.removal_data(runs),
+                            last_notes(runs)
+                        )),
+                    }
                 }
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i]
-                    .notes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len();
-                tracing::warn!(
-                    ms = started.elapsed().as_millis(),
-                    commands,
-                    "slow host list"
-                );
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = batch_runs[i]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(
+                        ms = started.elapsed().as_millis(),
+                        commands,
+                        "slow host list"
+                    );
+                    for (ms, op) in batch_runs[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
+                let _ = (i, started);
             }
-            let _ = (i, started);
+            let _ = &firsts;
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1160,10 +1710,33 @@ impl Host {
         }
         self.log_messages();
         drop(submitted);
-        release_epoch_in(exec_state, exec_epoch);
+        drop(exec_epoch);
         woken.run();
     }
+}
 
+/// Index ranges into a submission where each `HostList` pointer appears at
+/// most once. Used so [`HostList::prelude`] is never reset while a prior
+/// recording of the same list is still queued for `ExecuteCommandLists`.
+fn unique_list_batches(ptrs: &[usize]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut seen = std::collections::HashSet::new();
+    for (i, &ptr) in ptrs.iter().enumerate() {
+        if !seen.insert(ptr) {
+            batches.push(start..i);
+            seen.clear();
+            seen.insert(ptr);
+            start = i;
+        }
+    }
+    if start < ptrs.len() {
+        batches.push(start..ptrs.len());
+    }
+    batches
+}
+
+impl Host {
     /// Fallback completion wait when registering or waiting on `self.event`
     /// fails after `self.queue.Signal(&self.fence, target)` succeeded, so
     /// copy-back, writes, and epoch retirement never run while the GPU may
@@ -1505,6 +2078,7 @@ impl HostList {
 
     /// Track resolved buffers by resource identity, including aliasing title addresses.
     pub(crate) fn use_shadow(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        self.mark_work();
         let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
         let (_, state) = states
             .entry(buffer.as_raw() as usize)
@@ -1536,6 +2110,7 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
         drop(states);
+        self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -1565,18 +2140,24 @@ impl HostList {
 
     fn ensure_epoch(&self, _guard: &std::sync::MutexGuard<'_, ()>) {
         if self.epoch.load(Ordering::Acquire) == 0 {
-            let e = acquire_epoch_in(self.retire_state());
+            let e = acquire_epoch_in(self.retire_state(), self.work_seq.clone());
             self.epoch.store(e, Ordering::Release);
         }
     }
 
-    /// Pins a retirement epoch for this list once it records GPU work, so
-    /// retired host resources remain alive until the list executes or resets.
+    /// Pins a retirement epoch for this list once it records GPU work, and
+    /// advances `work_seq` lock-free when new resources have been created
+    /// since the last command on this list.
     pub(crate) fn mark_work(&self) {
+        let seq = RESOURCE_SEQ.load(Ordering::Acquire);
         if self.epoch.load(Ordering::Acquire) != 0 {
+            if self.work_seq.load(Ordering::Relaxed) < seq {
+                self.work_seq.fetch_max(seq, Ordering::AcqRel);
+            }
             return;
         }
         let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.work_seq.fetch_max(seq, Ordering::AcqRel);
         self.ensure_epoch(&guard);
     }
 
@@ -1590,6 +2171,8 @@ impl HostList {
 
     /// Releases a queued submission pin and, if it was the last in-flight
     /// submission for this list, releases the list's retirement epoch.
+    /// Keeps `work_seq` intact so a subsequent resubmission of the same closed
+    /// list still protects resources recorded into it.
     pub(crate) fn end_submit(&self) {
         let released = {
             let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1614,15 +2197,21 @@ impl HostList {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 
-    #[cfg(test)]
     pub(crate) fn has_epoch(&self) -> bool {
         self.epoch.load(Ordering::Acquire) != 0
     }
 
     fn release_epoch(&self) {
+        self.release_epoch_inner(false);
+    }
+
+    fn release_epoch_inner(&self, clear_work_seq: bool) {
         let released = {
             let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
             if self.in_flight.load(Ordering::Acquire) == 0 {
+                if clear_work_seq {
+                    self.work_seq.store(0, Ordering::Relaxed);
+                }
                 self.epoch.swap(0, Ordering::AcqRel)
             } else {
                 0
@@ -1646,6 +2235,7 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.state_gen.store(0, Ordering::Relaxed);
         self.dirty_resources
             .lock()
@@ -1676,7 +2266,7 @@ impl HostList {
             rect.counters.clear();
             (rect.counter_chunk, rect.counter_used) = (0, 0);
         }
-        self.release_epoch();
+        self.release_epoch_inner(true);
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -1705,7 +2295,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
-        self.release_epoch();
+        self.release_epoch_inner(true);
     }
 
     /// The host state currently tracked for `resource` on this list, falling
@@ -1836,25 +2426,271 @@ impl HostList {
         (len, slice.to_vec())
     }
 
-    /// At submission: the list that moves each texture this list uses from
-    /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
-        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, _, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
-                        &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
+    /// Moves `copy` to `wanted` (a host state) in this list, recording the
+    /// barrier if the list had it elsewhere. Like [`Self::transition`] for a
+    /// host texture the title has no resource for (a depth texture's twin).
+    pub(crate) fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, None, copy.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some(before)
+            }
+        };
+        drop(states);
+        if let Some(before) = before {
+            let barrier = transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    /// A use of title texture `resource` about to be recorded, if it is a
+    /// depth texture with a colour twin (false if it is not): of the twin
+    /// (`colour`: unordered access) or of the depth texture (depth target,
+    /// clear, shader read, copy, resolve), writing it or only reading. The
+    /// side used is first brought up to date: by a copy recorded here if
+    /// this list wrote the other side since, by the list's prelude if the
+    /// list uses the side as it finds it. The twin is left in the
+    /// unordered access state; the caller moves the depth texture to the
+    /// state its use needs, as for any texture. A twin still ahead when the
+    /// list closes is copied then (`twins_to_depth`).
+    /// shortcut: every depth target bound for a draw counts as written
+    /// (also when the draw only tests), and every unordered access view a
+    /// shader names as written; views a shader picks from the heap by a
+    /// computed index are not seen here at all.
+    pub(crate) fn twin_use(
+        &self,
+        resource: crate::object::This,
+        colour: bool,
+        write: bool,
+    ) -> bool {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        // Asked for every texture a draw reads: most have no twin.
+        let Some(twin) = crate::resource::twin(resource) else {
+            return false;
+        };
+        let Some(depth) = crate::resource::host_copy(resource) else {
+            return false;
+        };
+        let side = usize::from(colour);
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let u = twins
+            .entry(std::sync::Arc::as_ptr(&twin) as usize)
+            .or_insert_with(|| TwinUse {
+                depth: depth.clone(),
+                twin: twin.clone(),
+                needs: [false; 2],
+                behind: [None; 2],
+                writing: false,
+                late: false,
+            });
+        let copy = match u.behind[side] {
+            Some(behind) => behind,
+            None => {
+                u.needs[side] = true;
+                false
+            }
+        };
+        u.behind[side] = Some(false);
+        match (write, colour) {
+            // Shaders write the twin when the draw or dispatch runs: what
+            // the same one reads of the depth texture is prepared before
+            // (`twins_written`).
+            (true, true) => u.writing = true,
+            (true, false) => u.behind[1] = Some(true),
+            (false, _) => {}
+        }
+        // shortcut: the depth plane's twin is not drawn into the plane
+        // here: the pass sets a pipeline and a target of ours, which a list
+        // still recording the title's commands cannot take. This use sees
+        // the plane as it was; the pass runs when the list closes
+        // (`twins_to_depth`). Counted.
+        if copy && !colour && twin.plane.is_some() {
+            u.late = true;
+            crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+        }
+        drop(twins);
+        if copy {
+            self.twin_copy(&depth, &twin, colour);
+        } else if colour {
+            self.settle(&twin.colour, UNORDERED_ACCESS);
+        }
+        // The depth plane's twin is written through unordered access too.
+        if colour && let Some(plane) = &twin.plane {
+            self.settle(plane, UNORDERED_ACCESS);
+        }
+        true
+    }
+
+    /// Records the pass that draws the twin of the depth plane of `depth`
+    /// into the plane, if `twin` has one, with the moves to the states the
+    /// pass needs; the twin is left in the unordered access state. Only
+    /// for a list that records nothing of the title's afterwards
+    /// (`record_plane_pass`).
+    fn pass_plane(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &crate::resource::Twin,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+        let Some(plane) = &twin.plane else { return };
+        self.settle(depth, DEPTH_WRITE);
+        self.settle(plane, PIXEL_SHADER_RESOURCE);
+        record_plane_pass(
+            &self.list,
+            &depth.texture,
+            &plane.texture,
+            &twin.plane_views,
+        );
+        self.settle(plane, UNORDERED_ACCESS);
+    }
+
+    /// Records the copy of a depth texture into its colour twin (`colour`)
+    /// or of the twin into the depth texture, with the moves to the copy
+    /// states. The twin is left in the unordered access state.
+    fn twin_copy(
+        &self,
+        depth: &std::sync::Arc<crate::resource::HostTexture>,
+        twin: &crate::resource::Twin,
+        colour: bool,
+    ) {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let (from, to) = if colour {
+            (depth, &twin.colour)
+        } else {
+            (&twin.colour, depth)
+        };
+        self.settle(from, COPY_SOURCE);
+        self.settle(to, COPY_DEST);
+        record_twin_copy(&self.list, &depth.texture, twin, colour);
+        self.settle(&twin.colour, UNORDERED_ACCESS);
+    }
+
+    /// Before the list closes: the depth textures whose twins it wrote last
+    /// are given what was written, and left readable by shaders. Shaders
+    /// that pick a view from the heap by a computed index are not seen by
+    /// `twin_use` and read the depth texture in lists that never name it.
+    fn twins_to_depth(&self) {
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let written: Vec<_> = twins
+            .values_mut()
+            .filter(|u| u.behind[0] == Some(true) || u.late)
+            .map(|u| {
+                // Not copied again if the list copied since the last write
+                // and only the depth plane's pass is left.
+                let copy = u.behind[0] == Some(true);
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone(), copy)
             })
             .collect();
-        if barriers.is_empty() {
+        drop(twins);
+        for (depth, twin, copy) in &written {
+            if *copy {
+                self.twin_copy(depth, twin, false);
+            }
+            // Nothing of the title's is recorded after this: the pass may
+            // leave its own pipeline and target set.
+            self.pass_plane(depth, twin);
+            self.settle(depth, SHADER_RESOURCE);
+        }
+    }
+
+    /// The draw or dispatch just prepared is recorded: the twins it writes
+    /// now hold what their depth textures lack.
+    pub(crate) fn twins_written(&self) {
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        for u in twins.values_mut().filter(|u| u.writing) {
+            u.writing = false;
+            u.behind[0] = Some(true);
+        }
+    }
+
+    /// At submission: the list that moves each texture this list uses from
+    /// its real state to the one the list starts with; the textures' real
+    /// states become those the list ends with. For depth textures with a
+    /// colour twin it first copies the side the list uses as it finds it
+    /// from the other, if a list submitted earlier left it behind.
+    fn prelude(&self) -> Option<ID3D12CommandList> {
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        // The copies (depth texture, twin, whether into the twin); the
+        // sides are then as this list leaves them.
+        let mut syncs = Vec::new();
+        let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        for u in twins.values() {
+            let real = u.twin.behind.load(Ordering::Relaxed);
+            let mut behind = [real & 1 != 0, real & 2 != 0];
+            for side in [0, 1] {
+                if u.needs[side] && behind[side] {
+                    syncs.push((u.depth.clone(), u.twin.clone(), side == 1));
+                    behind = [false; 2];
+                }
+            }
+            let mut left = [0, 1].map(|side| u.behind[side].unwrap_or(behind[side]));
+            if u.late {
+                left[0] = true;
+            }
+            let left = u32::from(left[0]) | (u32::from(left[1]) << 1);
+            u.twin.behind.store(left, Ordering::Relaxed);
+        }
+        drop(twins);
+        // A copy runs with its textures in the copy states: each moves
+        // there from its real state, and from there to the state the list
+        // starts with (back to its real state if the list does not use it).
+        let mut to_copy = Vec::new();
+        let mut barriers = Vec::new();
+        let mut copying = std::collections::HashMap::new();
+        for (depth, twin, colour) in &syncs {
+            let (from, to) = if *colour {
+                (depth, &twin.colour)
+            } else {
+                (&twin.colour, depth)
+            };
+            for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
+                let key = std::sync::Arc::as_ptr(texture) as usize;
+                let real = texture.state.load(Ordering::Relaxed);
+                copying.insert(key, state);
+                if real != state {
+                    to_copy.push(transition(
+                        &texture.texture,
+                        host_state(real),
+                        host_state(state),
+                    ));
+                    if !states.contains_key(&key) {
+                        barriers.push(transition(
+                            &texture.texture,
+                            host_state(state),
+                            host_state(real),
+                        ));
+                    }
+                }
+            }
+        }
+        barriers.extend(states.iter().filter_map(|(key, (first, last, _, copy))| {
+            let real = copy.state.swap(*last, Ordering::Relaxed);
+            let real = copying.get(key).copied().unwrap_or(real);
+            (real != *first)
+                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
+        }));
+        if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1863,7 +2699,15 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !to_copy.is_empty() {
+                    list.ResourceBarrier(&to_copy);
+                }
+                for (depth, twin, colour) in &syncs {
+                    record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                if !barriers.is_empty() {
+                    list.ResourceBarrier(&barriers);
+                }
                 list.Close()
             })
         };
@@ -1927,7 +2771,13 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Copies `len` bytes from `src` to `dst` when the list is submitted.
+    /// Copies `len` bytes from `src` to title memory at `dst` when the list
+    /// is submitted (`Step::Copy` → `copy_mapped(..., title_dst = true)`).
+    ///
+    /// Title destinations keep the `VirtualQuery` commitment guard. Host-owned
+    /// mapped upload memory must use [`Self::defer_fill`] instead: under
+    /// Wine+vkd3d, `Map` pointers can report as `MEM_FREE` and the guard would
+    /// skip the copy (#518).
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
         let mut deferred = self.deferred();
@@ -1946,33 +2796,17 @@ impl HostList {
         self.deferred().copy_gen
     }
 
-    /// Copies `len` bytes of title memory at `src` into the list's upload
-    /// memory at `dst` when the list is submitted.
+    /// Copies `len` bytes of title memory at `src` into host-owned upload
+    /// memory at `dst` when the list is submitted (`Step::Fill` →
+    /// `copy_mapped(..., title_dst = false)`).
+    ///
+    /// Buffer→texture staging in `copy_texture_region` uses this; buffer→buffer
+    /// title copies stay on [`Self::defer_copy`].
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
-    }
-
-    /// Copies `len` bytes of title memory at `src` into `dst` (mapped inside
-    /// `upload`) when the list is submitted, keeping `upload` alive until the
-    /// list is reset.
-    pub(crate) fn defer_fill_upload(
-        &self,
-        upload: ID3D12Resource,
-        dst: *mut u8,
-        src: *const u8,
-        len: usize,
-    ) {
-        self.mark_work();
-        let mut d = self.deferred();
-        // Every draw or dispatch that binds the slot asks; until a title
-        // copy intervenes another fill would copy the same bytes again.
-        if d.first_fill(dst as usize, src as usize, len) {
-            d.uploads.push(upload);
-            d.copies.push(Step::Fill(dst as usize, src as usize, len));
-        }
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2221,9 +3055,34 @@ impl HostList {
     }
 
     /// Whether this is the first time since the reset that the list asks
-    /// about `key` (a texture to bring up to date).
+    /// about `key` (a memory copy to bring up to date, keyed away from any
+    /// texture's).
     pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+        self.deferred().textures.insert(key, 0).is_none()
+    }
+
+    /// Whether this list already covers the requested mip and all smaller ones.
+    pub(crate) fn covers_texture(&self, key: usize, first: u32) -> bool {
+        self.deferred()
+            .textures
+            .get(&key)
+            .is_some_and(|&seen| seen <= first)
+    }
+
+    /// Records coverage and reports whether the list gained any mip levels.
+    pub(crate) fn use_texture(&self, key: usize, first: u32) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.deferred().textures.entry(key) {
+            Entry::Occupied(mut e) if first < *e.get() => {
+                e.insert(first);
+                true
+            }
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(first);
+                true
+            }
+        }
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -2392,6 +3251,11 @@ impl Batch {
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
+            if let Some(bytes) = crate::shadow::skipped(to - from, copied) {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, bytes);
+            }
+            #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -2404,6 +3268,12 @@ impl Batch {
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped takes nothing from its
 /// first unmapped page on.
+///
+/// Host-owned staging uploads pass `title_dst = false` (`Step::Fill` /
+/// [`HostList::defer_fill`]): those destinations are known mapped, and under
+/// Wine+vkd3d `VirtualQuery` can report them as `MEM_FREE`, so the commitment
+/// guard must not apply (#518). Title buffer destinations keep `title_dst =
+/// true` (`Step::Copy` / [`HostList::defer_copy`]).
 ///
 /// The copy runs in the kernel (`ReadProcessMemory`), which reports an
 /// unmapped page of the source, or of the destination it writes, instead of
@@ -2542,16 +3412,72 @@ pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
     written
 }
 
+#[derive(Clone, Copy)]
+enum CopyBack {
+    WineRead,
+    NativeWrite(NtWrite),
+}
+
+/// Select the checked same-process copy once. Proton's read path is much
+/// cheaper for the small rows and pages written back after a submission.
+fn copy_back_method() -> Option<CopyBack> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static METHOD: std::sync::OnceLock<Option<CopyBack>> = std::sync::OnceLock::new();
+    *METHOD.get_or_init(|| {
+        // SAFETY: ntdll is always loaded. Wine identifies itself by this export;
+        // on native Windows the write routine has the NtWrite signature.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            if GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some() {
+                return Some(CopyBack::WineRead);
+            }
+            let f = GetProcAddress(ntdll, c"NtWriteVirtualMemory".as_ptr().cast())?;
+            Some(CopyBack::NativeWrite(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                NtWrite,
+            >(f)))
+        }
+    })
+}
+
+type NtWrite = unsafe extern "system" fn(
+    process: isize,
+    base: *mut core::ffi::c_void,
+    buffer: *const core::ffi::c_void,
+    len: usize,
+    written: *mut usize,
+) -> i32;
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
-/// Through [`read`]: the kernel refuses an unmapped destination page as it
-/// does a source page. `WriteProcessMemory` makes the same copy, but asks
-/// for the destination's region first, at `VirtualQuery`'s cost (see
-/// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
-/// per frame.
+/// Wine uses the checked read into the destination. Native Windows uses
+/// the NT write directly, avoiding the region query and temporary changes
+/// to read-only page protections that WriteProcessMemory can perform.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let Some(method) = copy_back_method() else {
+        return;
+    };
+    let write = |at: usize, n: usize| {
+        let from = src.wrapping_add(at - dst as usize);
+        let CopyBack::NativeWrite(call) = method else {
+            return read(from, at as *mut u8, n);
+        };
+        let mut done = 0;
+        // SAFETY: the source is our mapped host copy; the kernel checks the
+        // destination.
+        unsafe {
+            // STATUS_SUCCESS only: a partial copy is a failure here too.
+            call(
+                GetCurrentProcess() as isize,
+                at as _,
+                from.cast(),
+                n,
+                &mut done,
+            ) == 0
+        }
+    };
     if len == 0 || write(dst as usize, len) {
         return;
     }
@@ -2683,6 +3609,52 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    /// Host-owned staging (`title_dst = false`, `defer_fill`) still copies;
+    /// title destinations (`title_dst = true`, `defer_copy`) keep the
+    /// commitment guard. Wine+vkd3d can report Map memory as MEM_FREE, which
+    /// is why buffer→texture staging must not use the title path (#518).
+    #[test]
+    fn host_staging_fill_copies_while_title_dst_keeps_the_commitment_guard() {
+        let from = pattern();
+        // Fill path: a heap buffer stands in for mapped upload memory.
+        let mut staging = vec![0u8; BLOCK];
+        copy_mapped(staging.as_mut_ptr(), from.as_ptr(), BLOCK, false);
+        assert_eq!(&staging[..], &from[..BLOCK]);
+        // Copy path: an unmapped hole in the title destination stops the
+        // write; the trailing committed block stays untouched.
+        let title = holed(0xee);
+        copy_mapped(title, from.as_ptr(), 3 * BLOCK, true);
+        assert!(block(title, 2).iter().all(|&b| b == 0xee));
+        release(title);
+    }
+
+    // Run on both revisions with --ignored --nocapture to measure the active path.
+    #[test]
+    #[ignore = "local copy-back timing"]
+    fn time_small_copy_backs() {
+        const ROW: usize = 4096;
+        let source = vec![0xf3; ROW * 1024];
+        let mut dest = vec![0; source.len()];
+        let mut samples = Vec::new();
+        for round in 0..10 {
+            dest.fill(0);
+            let start = std::time::Instant::now();
+            for offset in (0..source.len()).step_by(ROW) {
+                write_mapped(dest[offset..].as_mut_ptr(), source[offset..].as_ptr(), ROW);
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(dest, source);
+            if round >= 2 {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "1024 x 4 KiB copy-backs, median {:?}",
+            (samples[3] + samples[4]) / 2
+        );
     }
 
     #[test]
@@ -2957,6 +3929,8 @@ struct Meter {
 
 impl Meter {
     fn new() -> Self {
+        #[cfg(feature = "diagnostics")]
+        crate::profile::start();
         let now = std::time::Instant::now();
         Meter {
             since: now,
@@ -3012,6 +3986,16 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            let twins = crate::resource::TWINS[0].load(Ordering::Relaxed);
+            if twins > 0 {
+                let [to_depth, to_twin] = [2, 3]
+                    .map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "depth twins: {twins} alive, {} depth textures left without one; \
+                     copies per frame: {to_depth:.1} into depth textures, {to_twin:.1} into twins",
+                    crate::resource::TWINS[1].load(Ordering::Relaxed)
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -3074,14 +4058,44 @@ impl Host {
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retry = self.present_retry.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        // After a failure, wait for the backoff: one attempt per state, not
+        // one per frame.
+        if !retry.due(now) {
+            return None;
+        }
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+            match self.presenter(width, height, format) {
+                Ok(p) => {
+                    let attempts = retry.reset();
+                    if attempts > 0 {
+                        tracing::info!(attempts, "swap chain created after the failed attempts");
+                    }
+                    *presenter = Some(p);
+                }
+                Err((step, e)) => {
+                    retry.failed(now);
+                    if retry.attempts == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            step = step.name(),
+                            width,
+                            height,
+                            format = format.0,
+                            "no swap chain; the next attempt waits for the backoff"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            step = step.name(),
+                            attempts = retry.attempts,
+                            "no swap chain"
+                        );
+                    }
                     return None;
                 }
-            };
+            }
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
@@ -3091,9 +4105,26 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    retry.reset();
+                    (p.width, p.height, p.format) = (width, height, format);
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    retry.failed(now);
+                    if retry.attempts == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            width,
+                            height,
+                            "swap chain not resized; the next attempt waits for the backoff"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            attempts = retry.attempts,
+                            "swap chain not resized"
+                        );
+                    }
                     return None;
                 }
             }
@@ -3193,14 +4224,15 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> windows::core::Result<Presenter> {
+    ) -> Result<Presenter, (PresentStep, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(width, height).map_err(|e| (PresentStep::Window, e))?,
         };
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| (PresentStep::Factory, e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -3215,9 +4247,11 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .map_err(|e| (PresentStep::SwapChain, e))?
+                .cast::<IDXGISwapChain3>()
+                .map_err(|e| (PresentStep::SwapChain, e))?;
+            let copy = self.new_list().map_err(|e| (PresentStep::List, e))?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             let mut p = Presenter {
@@ -3778,22 +4812,6 @@ mod tests {
         assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
     }
 
-    /// A slot's upload fill is asked for by every draw that binds it: the
-    /// list takes it once, and again only after a title copy (which forgets
-    /// what was refreshed, as `defer_copy` and `defer` do).
-    #[test]
-    fn an_upload_fill_is_taken_once_until_a_title_copy() {
-        let mut d = Deferred::default();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-        assert!(!d.first_fill(0x1000, 0x2000, 24));
-        // Another source, length or upload is a fill of its own.
-        assert!(d.first_fill(0x1000, 0x2018, 24));
-        assert!(d.first_fill(0x1000, 0x2000, 48));
-        assert!(d.first_fill(0x3000, 0x2000, 24));
-        d.refreshed.clear();
-        assert!(d.first_fill(0x1000, 0x2000, 24));
-    }
-
     #[test]
     fn adapter_filter_matches_case_insensitively() {
         assert!(adapter_matches("NVIDIA GeForce RTX 3070 Ti", "rtx 3070"));
@@ -3936,6 +4954,130 @@ mod tests {
     }
 
     #[test]
+    fn empty_execute_does_not_submit() {
+        // D3D12 forbids ExecuteCommandLists with NumCommandLists == 0.
+        let Some(host) = host() else {
+            return;
+        };
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[]);
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(before, after, "empty execute must not bump the fence");
+    }
+
+    #[test]
+    fn unique_list_batches_splits_on_repeated_pointers() {
+        assert!(unique_list_batches(&[]).is_empty());
+        assert_eq!(unique_list_batches(&[1]), vec![0..1]);
+        assert_eq!(unique_list_batches(&[1, 2, 3]), vec![0..3]);
+        assert_eq!(unique_list_batches(&[1, 1]), vec![0..1, 1..2]);
+        assert_eq!(unique_list_batches(&[1, 2, 1]), vec![0..2, 2..3]);
+        assert_eq!(unique_list_batches(&[1, 2, 1, 2]), vec![0..2, 2..4]);
+        assert_eq!(unique_list_batches(&[7, 7, 7]), vec![0..1, 1..2, 2..3]);
+    }
+
+    #[test]
+    fn duplicate_list_execute_splits_submissions() {
+        // VIC-BT-001: the same HostList twice must not Reset its prelude
+        // allocator while the first recording is still queued. Exact batch
+        // counts are covered by `unique_list_batches` (process-wide
+        // `submitted` races with parallel GPU tests).
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        list.close();
+        let other = host.new_list().expect("other list");
+        other.close();
+
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[&list]);
+        let after_one = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_one > before,
+            "one list must wait at least one submission"
+        );
+
+        host.execute(&[&list, &other]);
+        let after_unique = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_unique > after_one,
+            "two distinct lists must submit at least once"
+        );
+
+        host.execute(&[&list, &list]);
+        let after_dup = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            after_dup > after_unique,
+            "a repeated HostList must submit again (separate waited batches)"
+        );
+        // SAFETY: plain device-removed query after the duplicate submission.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn duplicate_list_execute_preserves_texture_state() {
+        // Synthetic reproducer from VIC-BT-001: list L transitions a texture
+        // (first != last). Submitting [L, L] must leave host state at `last`
+        // and must not remove the device from a clobbered prelude barrier.
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        const COPY_DEST: u32 = 0x400;
+        const RENDER_TARGET: u32 = 0x4;
+        // Record real barriers so prelude first/last states match the GPU list.
+        crate::list::ensure_state(&list, tex, COPY_DEST);
+        crate::list::ensure_state(&list, tex, RENDER_TARGET);
+        list.close();
+
+        host.execute(&[&list, &list]);
+
+        let copy = crate::resource::host_copy(tex).expect("host copy");
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            RENDER_TARGET,
+            "duplicate execute must leave the texture at the list's end state"
+        );
+        // SAFETY: plain device-removed query after prelude barriers ran twice.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
     fn active_execution_epoch_pins_objects_retired_during_execute() {
         let _retire = isolated_retire_scope();
         let Some(host) = host() else {
@@ -3956,6 +5098,95 @@ mod tests {
         list.close();
         host.execute(&[&list]);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_pinned_list_does_not_block_newer_born_retirements() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        // Simulate an early command list (e.g. oldest_epoch=2) that recorded
+        // work once and stays unreset indefinitely.
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        // A resource born after `stale` last recorded work must drop
+        // immediately once no newer epoch is active, without head-of-line
+        // blocking behind `stale`.
+        let born1 = birth_seq();
+        let (c1, d1) = DropCounter::new();
+        retire_born(c1, born1);
+        assert_eq!(
+            d1.load(Ordering::SeqCst),
+            1,
+            "stale pinned epoch must not block a resource created after its last work"
+        );
+
+        // A resource born before a newer active list must wait for that newer
+        // list, then drop as soon as the newer list finishes — still while
+        // `stale` remains pinned.
+        let born2 = birth_seq();
+        let active = host.new_list().expect("active list");
+        active.mark_work();
+        let (c2, d2) = DropCounter::new();
+        retire_born(c2, born2);
+        assert_eq!(d2.load(Ordering::SeqCst), 0);
+        active.close();
+        active.reset();
+        assert_eq!(
+            d2.load(Ordering::SeqCst),
+            1,
+            "resource must drop once its own blocking epoch finishes"
+        );
+
+        // If the older open list subsequently records new work after `born3`,
+        // its `work_seq` advances and `c3` MUST wait for `stale` to finish.
+        let born3 = birth_seq();
+        stale.mark_work();
+        let (c3, d3) = DropCounter::new();
+        retire_born(c3, born3);
+        assert_eq!(
+            d3.load(Ordering::SeqCst),
+            0,
+            "an open list that records work after birth_seq must pin that resource"
+        );
+        stale.close();
+        stale.reset();
+        assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resubmitted_closed_list_preserves_work_seq_until_second_completion() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let born = birth_seq();
+        let list = host.new_list().expect("reused list");
+        list.mark_work();
+        list.close();
+
+        // First submission completes and releases the epoch, but keeps
+        // `work_seq` because the list was not reset.
+        list.begin_submit();
+        host.execute(&[&list]);
+        list.end_submit();
+        assert!(!list.has_epoch());
+
+        // Second submission re-acquires an epoch preserving `work_seq >= born`.
+        list.begin_submit();
+        let (c, d) = DropCounter::new();
+        retire_born(c, born);
+        assert_eq!(
+            d.load(Ordering::SeqCst),
+            0,
+            "resubmitted closed list must keep resources from its recording alive"
+        );
+        host.execute(&[&list]);
+        assert_eq!(d.load(Ordering::SeqCst), 0);
+        list.end_submit();
+        assert_eq!(d.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4254,6 +5485,13 @@ mod tests {
                 );
                 assert!(
                     pooled
+                        .twins
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                );
+                assert!(
+                    pooled
                         .shadow_states
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -4510,5 +5748,321 @@ mod wave_tests {
         assert!(wave32_supported(true, 4, 128)); // WARP
         assert!(!wave32_supported(true, 64, 64)); // Wave64-only (GCN/Vega)
         assert!(!wave32_supported(false, 32, 32)); // No wave ops
+    }
+}
+
+#[cfg(test)]
+mod plane_shaders {
+    /// Build the actual pipelines so a blob without a usable root signature
+    /// cannot pass on the strength of a successfully compiled vertex shader.
+    #[cfg(victory_bundled_hlsl)]
+    #[test]
+    fn bundled_depth_helpers_build_both_pipelines() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        };
+        if super::host().is_none() {
+            return;
+        }
+        for (steps, format) in [
+            (true, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (false, DXGI_FORMAT_D32_FLOAT_S8X24_UINT),
+        ] {
+            super::PlanePass::make(steps, format).expect("depth plane pipeline");
+        }
+    }
+
+    /// The pass's shaders compile with one of our two compilers, whichever
+    /// this machine has (the system's `d3dcompiler` first, DXC when it
+    /// refuses them: Wine's builtin refuses other helpers' source), and the
+    /// bytecode is a DXBC container with the root signature inside.
+    #[test]
+    fn depth_plane_pass_shaders_compile() {
+        use victory_shader::{Container, FourCC};
+        let stages = [
+            ("corner", super::PLANE_CORNERS, "vs_5_1"),
+            ("plane", super::PLANE_STEPS, "ps_5_1"),
+            ("plane", super::PLANE_FLOATS, "ps_5_1"),
+        ];
+        for (entry, source, target) in stages {
+            let bytes = crate::hlsl::compile_stage("depth plane probe", source, entry, target)
+                .unwrap_or_else(|e| panic!("{entry} ({target}): {e}"));
+            let container = Container::parse(&bytes).unwrap();
+            if entry == "plane" {
+                assert!(
+                    [FourCC::RTS0, FourCC(*b"RDAT")]
+                        .iter()
+                        .any(|&part| container.part(part).is_some()),
+                    "{entry}: no root signature in the shader"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn depth_plane_draw_preserves_first_and_last_array_slices() {
+        use super::*;
+        let Some(host) = host() else {
+            eprintln!("Skipping depth plane array readback: no D3D12 device");
+            return;
+        };
+        const SLICES: u16 = 257;
+        let list = host.new_list().unwrap();
+        let texture = |format, flags, state| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: SLICES,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: the descriptors live through the call and the output slot is ours.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap()
+            };
+            texture.unwrap()
+        };
+        let plane = texture(
+            DXGI_FORMAT_R32_TYPELESS,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let depth = texture(
+            DXGI_FORMAT_R32G8X24_TYPELESS,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        );
+        let (upload, input) = host.upload_buffer(1024).unwrap();
+        let (readback, output) = host.readback_buffer(1024).unwrap();
+        let subresource = |resource: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: the resources remain live through submission; these descriptors borrow them.
+            pResource: unsafe { std::mem::transmute_copy(resource) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: index,
+            },
+        };
+        let location = |resource: &ID3D12Resource, texture: &ID3D12Resource, index, offset| {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            // SAFETY: the texture is live; index is in range, and one footprint is requested.
+            unsafe {
+                host.device.GetCopyableFootprints(
+                    &texture.GetDesc(),
+                    index,
+                    1,
+                    offset,
+                    Some(&mut footprint),
+                    None,
+                    None,
+                    None,
+                )
+            };
+            D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as for the subresource locations above.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            }
+        };
+        let samples = [(0, 0, 0.25_f32), (u32::from(SLICES) - 1, 512, 0.75_f32)];
+        for (index, offset, expected) in samples {
+            // SAFETY: an aligned f32 fits inside the 1024-byte upload buffer at both offsets.
+            unsafe { input.add(offset).cast::<f32>().write(expected) };
+            let src = location(&upload, &plane, index, offset as u64);
+            // SAFETY: both resources are in copy states and the locations cover one full texel.
+            unsafe {
+                list.list
+                    .CopyTextureRegion(&subresource(&plane, index), 0, 0, 0, &src, None)
+            };
+        }
+        // SAFETY: the plane was created in COPY_DEST and the list has not changed that state.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &plane,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )])
+        };
+        let plane_views = OnceLock::new();
+        record_plane_pass(&list.list, &depth, &plane, &plane_views);
+        // SAFETY: depth was created in DEPTH_WRITE and the pass leaves it in that state.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &depth,
+                D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )])
+        };
+        for (index, offset, _) in samples {
+            let dst = location(&readback, &depth, index, offset as u64);
+            // SAFETY: both locations are live, in their copy states and cover one full depth texel.
+            unsafe {
+                list.list
+                    .CopyTextureRegion(&dst, 0, 0, 0, &subresource(&depth, index), None)
+            };
+        }
+        list.mark_work();
+        list.close();
+        host.execute(&[&list]);
+        for (index, offset, expected) in samples {
+            // SAFETY: execute waited for the readback and both offsets are aligned within the mapping.
+            let actual = unsafe { output.add(offset).cast::<f32>().read() };
+            assert_eq!(actual, expected, "depth slice {index}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod title_memory_io {
+    use super::{copy_mapped, write_mapped};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const PAGE: usize = 4096;
+
+    /// Two committed pages followed by one reserved (not committed) page.
+    fn region() -> *mut u8 {
+        // SAFETY: a fresh reservation of ours, of which two pages are committed.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE);
+            assert!(!base.is_null());
+            let committed = VirtualAlloc(base, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!committed.is_null());
+            base.cast()
+        }
+    }
+
+    fn release(base: *mut u8) {
+        // SAFETY: the reservation made by `region`.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn write_mapped_writes_mapped_pages_and_skips_the_rest() {
+        let base = region();
+        let data = vec![0xabu8; 3 * PAGE];
+        // The third page is not committed: its piece is skipped, the others land.
+        write_mapped(base, data.as_ptr(), 3 * PAGE);
+        // SAFETY: the two committed pages of `region`.
+        let written = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
+        assert!(written.iter().all(|&b| b == 0xab));
+        release(base);
+    }
+
+    #[test]
+    fn copy_into_title_memory_that_is_not_all_mapped_is_left_alone() {
+        let base = region();
+        let from = vec![0x5au8; 3 * PAGE];
+        copy_mapped(base, from.as_ptr(), 3 * PAGE, true);
+        // A whole copy into mapped memory works without asking the system first.
+        copy_mapped(base, from.as_ptr(), 2 * PAGE, true);
+        // SAFETY: the two committed pages of `region`.
+        let now = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
+        assert!(now.iter().all(|&b| b == 0x5a));
+        release(base);
+    }
+}
+
+#[cfg(test)]
+mod present_retry {
+    use super::{PresentStep, Retry, retry_delay};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_backoff_starts_short_and_stops_at_a_second() {
+        let schedule: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_millis() as u64).collect();
+        assert_eq!(schedule, [100, 200, 400, 800, 1_000, 1_000, 1_000]);
+    }
+
+    #[test]
+    fn a_failed_attempt_waits_before_the_next_one() {
+        let start = Instant::now();
+        let mut retry = Retry::new();
+        // Nothing has failed, so an attempt is due.
+        assert!(retry.due(start));
+        retry.failed(start);
+        assert_eq!(retry.attempts, 1);
+        assert!(!retry.due(start));
+        assert!(!retry.due(start + Duration::from_millis(99)));
+        assert!(retry.due(start + Duration::from_millis(100)));
+        // A second failure doubles the wait and counts.
+        let second = start + Duration::from_millis(100);
+        retry.failed(second);
+        assert_eq!(retry.attempts, 2);
+        assert!(!retry.due(second + Duration::from_millis(199)));
+        assert!(retry.due(second + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn a_working_attempt_clears_the_state_and_reports_the_failures() {
+        let start = Instant::now();
+        let mut retry = Retry::new();
+        for _ in 0..3 {
+            retry.failed(start);
+        }
+        assert_eq!(retry.attempts, 3);
+        assert_eq!(retry.reset(), 3);
+        assert_eq!(retry.attempts, 0);
+        assert!(retry.due(start));
+        // A later failure starts the schedule over.
+        retry.failed(start);
+        assert!(!retry.due(start + Duration::from_millis(99)));
+    }
+
+    /// A minute behind a desktop that never appears: one attempt per backoff
+    /// instead of one per presented frame.
+    #[test]
+    fn a_minute_without_a_desktop_asks_a_bounded_number_of_times() {
+        let mut retry = Retry::new();
+        let mut now = Instant::now();
+        let mut attempts = 0u32;
+        for _ in 0..1_200 {
+            // 60 s at 20 fps.
+            if retry.due(now) {
+                attempts += 1;
+                retry.failed(now);
+            }
+            now += Duration::from_millis(50);
+        }
+        assert!(
+            (59..=64).contains(&attempts),
+            "{attempts} attempts in a minute, one per backoff expected"
+        );
+    }
+
+    #[test]
+    fn every_step_of_a_presenter_has_a_name() {
+        for step in [
+            PresentStep::Window,
+            PresentStep::Factory,
+            PresentStep::SwapChain,
+            PresentStep::List,
+        ] {
+            assert!(!step.name().is_empty());
+        }
     }
 }

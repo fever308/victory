@@ -1,6 +1,6 @@
 # Arquitetura
 
-> Tradução de [docs/architecture.md](../architecture.md), feita em 2026-11-23.
+> Tradução de [docs/architecture.md](../architecture.md), atualizada em 2026-11-25.
 > Em caso de divergência, vale a versão em inglês.
 
 ```
@@ -39,9 +39,9 @@ só como aquecimento.
 | `victory-hle` | implementações das APIs do console, política de repasse ao host |
 | `victory-gpu` | objetos D3D12.X, command lists e memória de GPU → D3D12 do host |
 | `victory-shader` | containers de shader do Xbox → shaders do host |
-| `victory-formats` | layouts de textura da GPU (tamanhos, tiling, detiling), codecs de áudio; planejado: BCPack |
+| `victory-formats` | layouts de textura da GPU (tamanhos, tiling, detiling), BCPack, codecs de áudio |
 | `victory-pipeline` | trait de conversor, cache endereçado por conteúdo |
-| `victory-game` | formatos, identidades de build e hooks específicos do título |
+| `victory-game` | formatos e identidades de build específicos do título |
 | `apps/victory` | interface de linha de comando |
 | `xtask` | verificação da política de assets, git hooks |
 | `tests/fixtures/hle-probe` | um "jogo" substituto (código nosso) para testes do loader |

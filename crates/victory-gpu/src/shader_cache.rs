@@ -172,7 +172,7 @@ fn cached(
         .unwrap_or_else(|| (converter.translate)(container))
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const REFUSAL_MAGIC: &[u8; 4] = b"VSE1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -228,7 +228,13 @@ fn encode(outcome: &Result<HostShader, String>) -> Vec<u8> {
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
     for u in &s.user_data {
-        for v in [u.index, u32::from(u.slot), root_code(u.root), u.dword] {
+        for v in [
+            u.index,
+            u32::from(u.slot),
+            root_code(u.root),
+            u.dword,
+            u32::from(u.indexed_buffer),
+        ] {
             word(&mut out, v);
         }
     }
@@ -300,6 +306,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
             slot: u8::try_from(r.word()?).ok()?,
             root: root_type(r.word()?),
             dword: r.word()?,
+            indexed_buffer: match r.word()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
         });
     }
     let n = r.word()? as usize;
@@ -345,6 +356,7 @@ mod tests {
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
+                indexed_buffer: true,
                 index: 8,
                 slot: 1,
                 root: RootType::Table,
@@ -384,7 +396,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);

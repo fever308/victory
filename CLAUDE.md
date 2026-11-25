@@ -65,8 +65,8 @@ Crate flow: game assets → `victory-pipeline` + `victory-game` (using `victory-
 `victory-shader`) → `cache_dir`; game executable → `victory-loader` → native title code →
 imports into `victory-hle` → D3D12.X into `victory-gpu` → host D3D12, with shaders translated by
 `victory-shader` at pipeline creation. Everything except `victory-game` is platform-level and
-testable with any Xbox Series title; title-specific code (formats, build identities, hooks)
-belongs only in `victory-game`.
+testable with any Xbox Series title; title-specific formats and build identities belong only
+in `victory-game`; per-build code hooks live in `victory-loader`.
 
 **Loader** (`victory-loader`): patches a copy of the image to look like a DLL (no entry point,
 no import directory, TLS callbacks detached) so the Windows loader maps/relocates it and

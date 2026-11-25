@@ -412,16 +412,15 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
                 // Lane i of a row picks nibble i of {src2, src1}: from its
                 // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
-                // reads.
+                // 32 lanes (permlanex16). FI allows reading a masked source.
+                // Otherwise BOUND_CTRL selects zero or preserves the destination.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all => {
+                    (Some(s1), Some(s2)) => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
@@ -431,7 +430,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                                     (l & !31) | ((l & 16) ^ 16)
                                 };
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(row | pick) as usize]
+                                let source = row | pick;
+                                if exec & (1 << source) != 0 || v.opsel & 1 != 0 {
+                                    a[source as usize]
+                                } else if v.opsel & 2 != 0 {
+                                    Sym::K(0)
+                                } else {
+                                    old[l as usize]
+                                }
                             })
                             .collect()
                     }
@@ -799,6 +805,54 @@ mod tests {
             found[&0].shapes.get(&total),
             Some(&Shape::Active(Op::AddU, x, saved, 0))
         );
+    }
+
+    #[test]
+    fn permlane_reads_inactive_sources_only_with_fetch_inactive() {
+        // gfx1030 wave32. Source lanes 0 and 16 carry different constants.
+        // Lane 17 reads one of them and lane 1 keeps its old destination.
+        for (permute, source, source_value) in [
+            (0xd777_0002, 16, 9), // v_permlane16_b32 v2, v1, 0, 0
+            (0xd778_0002, 0, 13), // v_permlanex16_b32 v2, v1, 0, 0
+        ] {
+            for source_active in [false, true] {
+                let exec = (1 << 17) | (u32::from(source_active) << source);
+                for mode in 0..4 {
+                    let words = [
+                        0xbe80_3dc1, // s_or_saveexec_b32 s0, -1
+                        0x7e02_0289, // v_mov_b32 v1, 9
+                        0x7e04_0287, // v_mov_b32 v2, 7
+                        0xbefe_0381, // s_mov_b32 exec_lo, 1
+                        0x7e02_028d, // v_mov_b32 v1, 13
+                        0xbefe_03ff,
+                        exec, // s_mov_b32 exec_lo, exec mask
+                        permute | (mode << 11),
+                        0x0201_0101,
+                        0xd760_0004,
+                        0x0001_2302, // v_readlane_b32 s4, v2, 17
+                        0xd760_0005,
+                        0x0001_0302, // v_readlane_b32 s5, v2, 1
+                        0xbefe_0300, // s_mov_b32 exec_lo, s0
+                        0xbf81_0000, // s_endpgm
+                    ];
+                    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    let p = crate::ir::build(&code, false, 8).unwrap();
+                    let insts = &p.blocks[0].insts;
+                    let found = sections(&p, 0);
+                    let result =
+                        |i: usize, r| found[&0].shapes.get(&insts[i].write(Reg::S(r)).unwrap());
+                    let want = if source_active || mode & 1 != 0 {
+                        source_value
+                    } else if mode & 2 != 0 {
+                        0
+                    } else {
+                        7
+                    };
+                    assert_eq!(result(7, 4), Some(&Shape::K(want)));
+                    assert_eq!(result(8, 5), Some(&Shape::K(7)));
+                }
+            }
+        }
     }
 
     fn build_wave64(words: &[u32]) -> Program {

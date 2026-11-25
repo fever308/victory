@@ -8,7 +8,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -393,9 +393,31 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Section handle, slice index and guest address for each mapped page.
+    aliases: BTreeSet<(usize, usize, usize)>,
 }
 
 impl Physical {
+    /// Guest views touched by a write through a worker's temporary section
+    /// view. The live section identifies the bytes even after page-number reuse.
+    fn written_views(
+        &self,
+        slice: &Slice,
+        within: usize,
+        bytes: usize,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let handle = slice.section.0 as usize;
+        let first = slice.index + within / PAGE;
+        let end = if bytes == 0 {
+            first
+        } else {
+            slice.index + (within + bytes).div_ceil(PAGE)
+        };
+        self.aliases
+            .range((handle, first, 0)..(handle, end, 0))
+            .map(|entry| entry.2)
+    }
+
     fn allocate(&mut self, section: Arc<Section>, numbers: &mut [MaybeUninit<usize>]) -> bool {
         let fresh = numbers.len().saturating_sub(self.free_pages.len());
         if fresh > (PAGE_NUMBER_LIMIT - self.next_page) / FRAMES {
@@ -596,6 +618,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        victory_gpu::mapped_pages_written(physical().written_views(slice, within, k));
         (within, done) = (0, done + k);
     }
     true
@@ -606,14 +629,26 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 /// would then copy.
 pub(crate) struct PageWindow {
     view: View,
+    slice: Slice,
     within: usize,
     len: usize,
 }
 
 impl PageWindow {
-    pub(crate) fn bytes(&mut self) -> &mut [u8] {
-        let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+    pub(crate) fn fill<E>(
+        mut self,
+        write: impl FnOnce(&mut [u8]) -> Result<usize, E>,
+    ) -> Result<(), E> {
+        let out = &mut self.view.bytes()[self.within..self.within + self.len];
+        let result = write(out);
+        // A failed read or decode can leave a partial prefix of unknown size.
+        let bytes = result.as_ref().copied().unwrap_or(self.len).min(self.len);
+        victory_gpu::mapped_pages_written(physical().written_views(
+            &self.slice,
+            self.within,
+            bytes,
+        ));
+        result.map(drop)
     }
 }
 
@@ -629,6 +664,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     };
     Some(PageWindow {
         view: View::map(slice, *n)?,
+        slice: slice.clone(),
         within: offset % PAGE,
         len,
     })
@@ -824,6 +860,11 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     for (at, len, part) in made {
         // New contents, read-write: the GPU side's copies no longer guard it.
         victory_gpu::title_memory_remapped(at, len);
+        for page in 0..len / PAGE {
+            physical
+                .aliases
+                .insert((part.section.0 as usize, part.index + page, at + page * PAGE));
+        }
         physical.views.insert(at, (len, part));
     }
     true
@@ -989,6 +1030,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        for page in 0..size / PAGE {
+            physical.aliases.remove(&(
+                slice.section.0 as usize,
+                slice.index + page,
+                at + page * PAGE,
+            ));
+        }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1535,6 +1583,61 @@ mod tests {
         assert_eq!(old_view.bytes()[0], 7);
     }
 
+    /// Streaming allocate/free must reuse page numbers. Without a free list,
+    /// `next_page` would climb by `n * FRAMES` each round and eventually pack
+    /// past the title's 21-bit `number >> 4` field. Uses a private `Physical`
+    /// so parallel suite tests cannot steal freed numbers or bump `next_page`.
+    #[test]
+    fn allocate_reuses_freed_page_numbers_without_growing_next_page() {
+        let section = || {
+            let size = 2 * PAGE;
+            // SAFETY: plain pagefile-backed section, same as the public allocate path.
+            let handle = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                    0,
+                    size as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!handle.is_null());
+            Arc::new(Section(handle))
+        };
+        let mut table = Physical {
+            next_page: FIRST_PAGE_NUMBER,
+            ..Physical::default()
+        };
+        let mut slots = [MaybeUninit::new(0); 2];
+        assert!(table.allocate(section(), &mut slots));
+        // SAFETY: both slots were filled by allocate.
+        let pages = unsafe { [slots[0].assume_init(), slots[1].assume_init()] };
+        let ceiling = table.next_page;
+        for &p in &pages {
+            table.free(p);
+        }
+        for _ in 0..1024 {
+            assert!(table.allocate(section(), &mut slots));
+            assert_eq!(table.next_page, ceiling);
+            // SAFETY: both slots were filled by allocate.
+            let again = unsafe { [slots[0].assume_init(), slots[1].assume_init()] };
+            for &p in &again {
+                assert!(p >> 4 < 1 << 21, "{p:#x}");
+                assert!(p > 0);
+            }
+            // Same numbers we freed (LIFO may reverse them within the batch).
+            let mut got = again;
+            got.sort_unstable();
+            let mut want = pages;
+            want.sort_unstable();
+            assert_eq!(got, want);
+            for &p in &again {
+                table.free(p);
+            }
+        }
+    }
+
     #[test]
     fn runs_group_consecutive_pages_of_one_allocation() {
         let (a, b) = (allocate(3), allocate(1));
@@ -1586,10 +1689,14 @@ mod tests {
     #[test]
     fn page_windows_cover_one_run_in_place() {
         let (a, b) = (allocate(3), allocate(1));
-        let mut window = page_window(&a, PAGE + 3, PAGE).expect("one run");
-        assert_eq!(window.bytes().len(), PAGE);
-        window.bytes().fill(0x5a);
-        drop(window);
+        page_window(&a, PAGE + 3, PAGE)
+            .expect("one run")
+            .fill(|out| {
+                assert_eq!(out.len(), PAGE);
+                out.fill(0x5a);
+                Ok::<_, ()>(out.len())
+            })
+            .unwrap();
         let (second, third) = (page_bytes(a[1]), page_bytes(a[2]));
         assert!(second[..3].iter().all(|&b| b == 0));
         assert!(second[3..].iter().all(|&b| b == 0x5a));
@@ -1623,6 +1730,34 @@ mod tests {
         );
         assert!(!reservation.is_null());
         (pages, reservation)
+    }
+
+    #[test]
+    fn storage_aliases_follow_partial_remaps() {
+        let (pages, a) = pages_and_reservation(3);
+        let (other, b) = pages_and_reservation(1);
+        let middle = a.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, pages[1..].as_ptr()), b);
+        let slice = physical().pages[&pages[0]].clone();
+        let addresses = |within, bytes| {
+            physical()
+                .written_views(&slice, within, bytes)
+                .collect::<Vec<_>>()
+        };
+        let mut both = [middle as usize, b as usize];
+        both.sort_unstable();
+        assert_eq!(addresses(PAGE + 17, 1), both);
+        assert!(addresses(PAGE + 17, 0).is_empty());
+        assert_eq!(XMemMapPhysicalPages(b, 1, other.as_ptr()), b);
+        assert_eq!(addresses(PAGE - 1, 2), [a as usize, middle as usize]);
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert!(addresses(PAGE, 1).is_empty());
+        assert_eq!(addresses(2 * PAGE, 1), [a as usize + 2 * PAGE]);
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, other.as_ptr()), 1);
     }
 
     /// Unmapping part of a run leaves the range as several host

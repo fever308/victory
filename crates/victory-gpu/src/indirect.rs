@@ -11,7 +11,9 @@
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
 //! so a list of thousands of garbage records cannot run for seconds
-//! either.
+//! either. The budget word is reserved with a saturating compare-and-exchange
+//! (modelled and tested in `indirect_budget`), so rejected records never
+//! wrap it and reopen the budget.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension and 2^20 per dispatch, one-dimensional mesh

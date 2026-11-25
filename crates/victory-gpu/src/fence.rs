@@ -17,12 +17,19 @@ use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 use crate::timeline::Timeline;
 
-pub(crate) const FENCE_IIDS: [Iid; 4] = [
+pub(crate) const FENCE_IIDS: [Iid; 5] = [
     guid(
         0x0a753dcf,
         0xc4d8,
         0x4b91,
         [0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76],
+    ),
+    // ID3D12Fence1: the same object, adding `GetCreationFlags`.
+    guid(
+        0x433685fe,
+        0xe22b,
+        0x4ca0,
+        [0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a],
     ),
     PAGEABLE_IIDS[0],
     PAGEABLE_IIDS[1],
@@ -507,6 +514,33 @@ mod tests {
             S_OK
         );
         f
+    }
+
+    #[test]
+    fn fence1_is_created_and_queried_with_creation_flags() {
+        let mut f = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), 0, 0x5, &FENCE_IIDS[1], &mut f),
+            S_OK
+        );
+        assert!(!f.is_null());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x58)(f), 0x5);
+        let mut again = std::ptr::null();
+        assert_eq!(
+            slot::<extern "system" fn(This, *const Iid, *mut This) -> HRESULT>(f, 0)(
+                f,
+                &FENCE_IIDS[1],
+                &mut again
+            ),
+            S_OK
+        );
+        assert_eq!(again, f);
+        // QueryInterface took a second reference.
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(again, 0x10)(again),
+            1
+        );
+        release_fence(f);
     }
 
     fn release_fence(f: This) {

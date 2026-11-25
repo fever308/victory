@@ -2,8 +2,12 @@
 //! 0007, step 3). Translated shaders index the heaps directly at the
 //! title's descriptor positions, so each host heap keeps the title heap's
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
-//! writes it (view creation and descriptor copies) and again when a draw
-//! reads it through a table and finds the slot changed.
+//! writes it (view creation and descriptor copies), when a heap is synced for
+//! direct CPU copies inside heap memory, and again when a draw reads it
+//! through a table and finds the slot changed. Draws that index
+//! `ResourceDescriptorHeap` also refresh the live buffer ranges tracked here
+//! ([`HostHeap::refresh_bindless_buffers`]) so heap-indexed views stay as
+//! current as table ones.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -15,24 +19,11 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::{Host, HostList, host};
 use crate::shadow::Shadow;
 
-/// An aligned upload copy backing a buffer SRV whose offset inside its shadow
-/// buffer is not a multiple of its element stride. Kept persistently mapped so
-/// each draw or dispatch using the slot can schedule a submission-time refresh
-/// (safe to overwrite in place because the host queue waits for each submission
-/// to finish before the next one runs).
-#[derive(Clone)]
-struct UnalignedCopy {
-    resource: ID3D12Resource,
-    dst: usize,
-    src: usize,
-    len: usize,
-}
-
-/// Submission-time refresh state for a slot: either an aligned copy upload or
-/// an aliased view whose exact backing shadow may differ from `buffer_range`.
+/// Submission-time refresh state for a slot whose exact backing shadow may
+/// differ from `buffer_range` (a structured alias, or a view off an element of
+/// its host copy that reads its own aligned copy).
 #[derive(Clone)]
 enum SlotRefresh {
-    Unaligned(UnalignedCopy),
     Shadow {
         shadow: Arc<Shadow>,
         address: u64,
@@ -40,10 +31,28 @@ enum SlotRefresh {
     },
 }
 
+/// Title resource and host `(MostDetailedMip, MipLevels)` a slot's SRV was
+/// made with after resident-mip narrowing.
+type SrvMips = (usize, (u32, u32));
+
 /// Maximum number of recent texture-descriptor writes retained in
 /// [`TexTracker::changes`] for incremental bindless sync across `tex_gen`
 /// bumps; overflowing falls back to a full `live_textures` walk once.
 const MAX_TEX_CHANGES: usize = 4096;
+
+/// Live title-memory buffer range a heap slot views, for bindless refresh.
+/// The bool is whether the view is unordered (refresh must leave the host
+/// copy in unordered-access state, not generic-read).
+type BufRange = (Arc<Shadow>, u64, u64, bool);
+
+/// Tracks which title slots hold buffer / constant views whose host copies
+/// need a submission-time refresh when a shader indexes `ResourceDescriptorHeap`.
+/// Unaligned and aliased structured slots stay in [`HostHeap::refreshes`] instead.
+#[derive(Default)]
+struct BufTracker {
+    /// Title slot → host copy range. Dynamic slots are never recorded.
+    live: HashMap<u32, BufRange>,
+}
 
 /// Tracks which live host textures each view-heap slot currently references,
 /// keeping `O(active)` live sets of SRV and UAV resources for bindless heaps.
@@ -59,13 +68,21 @@ struct TexTracker {
     /// Bounded ring of `(generation, resource)` additions/overwrites so
     /// `bindless_textures` can sync newly written descriptors incrementally.
     changes: VecDeque<(u64, usize)>,
-    slot_res: Vec<Option<(usize, bool)>>,
+    slot_res: Vec<Option<(usize, bool, u32)>>,
     live_srvs: HashMap<usize, u32>,
     live_uavs: HashMap<usize, u32>,
     res_slots: HashMap<(usize, bool), HashSet<u32>>,
 }
 
 impl TexTracker {
+    fn first_mip(&self, resource: usize) -> u32 {
+        self.res_slots[&(resource, false)]
+            .iter()
+            .filter_map(|&slot| self.slot_res[slot as usize].map(|(_, _, mip)| mip))
+            .min()
+            .unwrap_or(0)
+    }
+
     fn new(sampler: bool, count: u32) -> Self {
         Self {
             generation: 0,
@@ -128,6 +145,12 @@ impl TexTracker {
     }
 }
 
+type LiveTextures = (
+    u64,
+    Vec<(crate::object::Held, u32)>,
+    Vec<crate::object::Held>,
+);
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -145,14 +168,20 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Slots requiring submission-time title-memory refresh (`UnalignedCopy`
-    /// uploads or aliased structured SRV shadows).
+    /// Slots requiring submission-time title-memory refresh (aliased structured
+    /// SRV shadows, or a view's own copy when off an element of its host copy).
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
+    /// Host SRV mip windows `(MostDetailedMip, MipLevels)` after narrowing to
+    /// resident levels, by slot. Used to remake the view when more streamed
+    /// mips arrive (#616).
+    srv_mips: Mutex<HashMap<u32, SrvMips>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
+    /// Title slots holding buffer / constant views for bindless refresh.
+    buf_tracker: Mutex<BufTracker>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -342,8 +371,10 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             refreshes: Mutex::new(HashMap::new()),
+            srv_mips: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
+            buf_tracker: Mutex::new(BufTracker::default()),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -458,23 +489,7 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = super::find_free_run(taken, *next as usize, n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -557,18 +572,21 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, Kept::Empty);
+        self.track_buffer(index, None);
     }
 
     /// Slot `index` now views `kept` (or nothing of the host's).
     fn keep(&self, index: u32, kept: Kept) {
-        let (resource, refresh) = match kept {
-            Kept::Empty => (None, None),
-            Kept::Resource(r) => (Some(r), None),
-            Kept::Texture { resource, .. } => (Some(resource), None),
-            Kept::Unaligned(copy) => (
-                Some(copy.resource.clone()),
-                Some(SlotRefresh::Unaligned(copy)),
-            ),
+        let (resource, refresh, host_mips) = match kept {
+            Kept::Empty => (None, None, None),
+            Kept::Resource(r) => (Some(r), None, None),
+            Kept::Texture {
+                resource,
+                title,
+                is_uav: false,
+                host_mips: Some(mips),
+            } => (Some(resource), None, Some((title, mips))),
+            Kept::Texture { resource, .. } => (Some(resource), None, None),
             Kept::AliasedShadow {
                 shadow,
                 address,
@@ -580,6 +598,7 @@ impl HostHeap {
                     address,
                     len,
                 }),
+                None,
             ),
         };
         let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -591,6 +610,18 @@ impl HostHeap {
             }
         }
         drop(slots);
+        {
+            let mut map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            match host_mips {
+                Some(entry) => {
+                    map.insert(index, entry);
+                }
+                None if !map.is_empty() => {
+                    map.remove(&index);
+                }
+                None => {}
+            }
+        }
         let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
         match refresh {
             Some(entry) => {
@@ -603,9 +634,9 @@ impl HostHeap {
         }
     }
 
-    /// If slot `index` has a registered refresh entry (`UnalignedCopy` upload
-    /// or aliased shadow range), schedules a submission-time refresh on `list`
-    /// and returns `true`.
+    /// If slot `index` has a registered refresh entry (aliased shadow or a
+    /// view's own copy), schedules a submission-time refresh on `list` and
+    /// returns `true`.
     pub(crate) fn refresh_slot(&self, index: u32, list: &HostList) -> bool {
         let refresh = {
             let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
@@ -615,15 +646,6 @@ impl HostHeap {
             map.get(&index).cloned()
         };
         match refresh {
-            Some(SlotRefresh::Unaligned(copy)) => {
-                list.defer_fill_upload(
-                    copy.resource,
-                    copy.dst as *mut u8,
-                    copy.src as *const u8,
-                    copy.len,
-                );
-                true
-            }
             Some(SlotRefresh::Shadow {
                 shadow,
                 address,
@@ -776,10 +798,20 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.track_slot(index, None);
+                self.track_buffer(index, None);
             }
             return None;
         };
-        if made[index as usize] != key {
+        // A streamed texture's host SRV may have been narrowed to the levels
+        // that had arrived; remake when more (or all) of them are there.
+        let widen = for_draw && !self.sampler && made[index as usize] == key && {
+            let map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            match map.get(&index) {
+                Some(&(title, host)) => residency_widened(&view, title, host),
+                None => false,
+            }
+        };
+        if made[index as usize] != key || widen {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -789,7 +821,16 @@ impl HostHeap {
             };
             let made_ok = kept.is_some();
             let new_entry = match &kept {
-                Some(Kept::Texture { title, is_uav, .. }) => Some((*title, *is_uav)),
+                Some(Kept::Texture { title, is_uav, .. }) => {
+                    Some((*title, *is_uav, placed_first_mip(&view)))
+                }
+                _ => None,
+            };
+            // Ordinary buffer / constant copies are not in `refreshes` (only
+            // unaligned and aliased structured slots are); record them so
+            // bindless draws can refresh the ranges they index.
+            let buf = match &kept {
+                Some(Kept::Resource(_)) => buffer_refresh_range(&view),
                 _ => None,
             };
             if !made_ok && !self.sampler {
@@ -797,20 +838,97 @@ impl HostHeap {
             }
             self.keep(index, kept.unwrap_or(Kept::Empty));
             self.track_slot(index, new_entry);
+            self.track_buffer(index, buf);
             // Close the race with `descriptor::forget` running between the initial
             // `view_at` lookup and `track_slot` before this heap's publication.
             if new_entry.is_some() && view_at(i, generation).is_none() {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.track_slot(index, None);
+                self.track_buffer(index, None);
                 return None;
             }
         }
         Some(view)
     }
 
+    /// Scans title descriptor slots `[first, end)` and mirrors any slot whose
+    /// on-heap `(tag, view_index, generation)` differs from what the host slot
+    /// was last made from, catching descriptors the title copied directly in
+    /// heap memory without calling a descriptor method.
+    pub(crate) fn sync_slots(
+        &self,
+        start: u64,
+        step: u64,
+        first: u32,
+        end: u32,
+        for_draw: bool,
+    ) -> usize {
+        let end = end.min(self.count);
+        if first >= end || step == 0 {
+            return 0;
+        }
+        let mut changed = Vec::new();
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for index in first..end {
+                let handle = start + u64::from(index) * step;
+                // SAFETY: `[first, end)` is bounded by `self.count` (which does
+                // not exceed the title heap's descriptor count) and each
+                // descriptor slot is at least 16 bytes.
+                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let expected = if tag == VIEW_TAG {
+                    u64::from(generation) << 32 | u64::from(i)
+                } else {
+                    0
+                };
+                if made[index as usize] != expected {
+                    changed.push(index);
+                }
+            }
+        }
+        let mut mirrored = 0;
+        for index in changed {
+            let handle = start + u64::from(index) * step;
+            self.mirror(index, handle, for_draw);
+            mirrored += 1;
+        }
+        mirrored
+    }
+
+    /// Remakes host SRVs that were narrowed to a streamed mip suffix once more
+    /// (or all) levels have arrived, even when the title descriptor itself did
+    /// not change — bindless ResourceHeap draws never walk tables, and
+    /// write-watch sync only remirrors dirty heap pages (#616).
+    pub(crate) fn remirror_widened_srvs(&self, start: u64, step: u64, for_draw: bool) -> usize {
+        if !for_draw || self.sampler || step == 0 {
+            return 0;
+        }
+        let candidates: Vec<(u32, SrvMips)> = {
+            let map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
+            map.iter()
+                .filter(|&(&index, _)| index < self.count)
+                .map(|(&index, &entry)| (index, entry))
+                .collect()
+        };
+        let mut mirrored = 0;
+        for (index, (title, host_mips)) in candidates {
+            let handle = start + u64::from(index) * step;
+            // SAFETY: slot index is below `self.count`; each descriptor is ≥16 bytes.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let Some(view) = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten() else {
+                continue;
+            };
+            if residency_widened(&view, title, host_mips) {
+                self.mirror(index, handle, for_draw);
+                mirrored += 1;
+            }
+        }
+        mirrored
+    }
+
     /// Updates the leaf-only live texture tracker for slot `index`.
-    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool)>) {
+    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool, u32)>) {
         if self.sampler {
             return;
         }
@@ -823,16 +941,76 @@ impl HostHeap {
             return;
         }
         *slot = new_entry;
-        if let Some((res, is_uav)) = old_entry {
+        if let Some((res, is_uav, _)) = old_entry {
             tracker.remove_entry(index, res, is_uav);
         }
-        if let Some((res, is_uav)) = new_entry {
+        if let Some((res, is_uav, _)) = new_entry {
             tracker.add_entry(index, res, is_uav);
         }
         tracker.generation += 1;
-        if let Some((res, _)) = new_entry {
+        if let Some((res, _, _)) = new_entry {
             tracker.record_change(res);
         }
+    }
+
+    /// Updates the live buffer-range tracker for title slot `index`.
+    fn track_buffer(&self, index: u32, range: Option<BufRange>) {
+        if self.sampler || index >= self.count {
+            return;
+        }
+        let mut tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        match range {
+            Some(range) => {
+                tracker.live.insert(index, range);
+            }
+            None => {
+                tracker.live.remove(&index);
+            }
+        }
+    }
+
+    /// Brings title-memory buffer ranges viewed by this heap's title slots up
+    /// to date for a draw or dispatch that indexes `ResourceDescriptorHeap`.
+    ///
+    /// Covers ordinary buffer / constant copies tracked in [`BufTracker`], and
+    /// unaligned / aliased structured slots registered in [`Self::refreshes`].
+    /// Unordered heap views refresh into unordered-access state so the
+    /// dispatch can write them; copy-back of heap-only UAV ranges is still
+    /// skipped (a full-heap snapshot is too expensive; table UAVs still go
+    /// through [`crate::draw`]'s `readable` path).
+    pub(crate) fn refresh_bindless_buffers(&self, list: &HostList) {
+        if self.sampler {
+            return;
+        }
+        let special: Vec<u32> = {
+            let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+            map.keys().copied().filter(|&i| i < self.count).collect()
+        };
+        for index in special {
+            let _ = self.refresh_slot(index, list);
+        }
+        let live: Vec<BufRange> = {
+            let tracker = self.buf_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.live.values().cloned().collect()
+        };
+        for (shadow, address, len, is_uav) in live {
+            let access = if is_uav {
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            };
+            shadow.refresh_as(list, address, len, access);
+        }
+    }
+
+    /// Live buffer ranges currently tracked for bindless refresh (tests).
+    #[cfg(test)]
+    pub(crate) fn live_buffer_count(&self) -> usize {
+        self.buf_tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live
+            .len()
     }
 
     /// Removes all tracked references to `resource` when the title releases it,
@@ -847,7 +1025,7 @@ impl HostHeap {
             if let Some(slots) = tracker.res_slots.remove(&(resource, is_uav)) {
                 for slot in slots {
                     if let Some(entry) = tracker.slot_res.get_mut(slot as usize)
-                        && *entry == Some((resource, is_uav))
+                        && entry.is_some_and(|(r, u, _)| (r, u) == (resource, is_uav))
                     {
                         *entry = None;
                     }
@@ -877,11 +1055,7 @@ impl HostHeap {
     /// Snapshot of `(tex_gen, live_srvs, live_uavs)` in `O(active)` time,
     /// pinning each live title `Resource` with [`crate::object::Held`] while
     /// `tex_tracker` is locked so concurrent releases cannot free it mid-pass.
-    pub(crate) fn live_textures(
-        &self,
-        srvs: bool,
-        uavs: bool,
-    ) -> (u64, Vec<crate::object::Held>, Vec<crate::object::Held>) {
+    pub(crate) fn live_textures(&self, srvs: bool, uavs: bool) -> LiveTextures {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         let pin = |r: &usize| {
             // SAFETY: while `tex_tracker` is held, any tracked `Resource` has
@@ -890,7 +1064,11 @@ impl HostHeap {
             unsafe { crate::object::Held::try_new(*r as crate::object::This) }
         };
         let srv_list = if srvs {
-            tracker.live_srvs.keys().filter_map(pin).collect()
+            tracker
+                .live_srvs
+                .keys()
+                .filter_map(|r| Some((pin(r)?, tracker.first_mip(*r))))
+                .collect()
         } else {
             Vec::new()
         };
@@ -913,7 +1091,7 @@ impl HostHeap {
         extra_candidates: &[usize],
         srvs: bool,
         uavs: bool,
-    ) -> Option<(u64, Vec<crate::object::Held>, Vec<crate::object::Held>)> {
+    ) -> Option<LiveTextures> {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         if since_gen < tracker.oldest_gen {
             return None;
@@ -944,9 +1122,9 @@ impl HostHeap {
                 {
                     uav_list.push(second);
                 }
-                srv_list.push(held);
+                srv_list.push((held, tracker.first_mip(r)));
             } else if is_srv {
-                srv_list.push(held);
+                srv_list.push((held, tracker.first_mip(r)));
             } else {
                 uav_list.push(held);
             }
@@ -1011,6 +1189,169 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Narrows a shader resource view of `texture` to the mips of `resource`
+/// whose memory is there: `MostDetailedMip` up to the most detailed resident
+/// one, `MipLevels` to what is left. Returns the mips the host view names,
+/// `None` if the view is left as the title asked (fully mapped, host-written,
+/// not a 2D view, or nothing known yet).
+fn narrow_to_resident(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Option<(u32, u32)> {
+    // A copy/resolve filled the host mip chain; title-memory residency is
+    // stale and must not clamp the view (#616).
+    if crate::texture::is_host_written(resource) {
+        return None;
+    }
+    // Prefer the window the last staging refresh noted; fall back to a live
+    // mapped-prefix query so the first view before any upload is still clamped.
+    let resident =
+        crate::texture::resident(resource).or_else(|| crate::texture::live_resident(resource))?;
+    if resident.1 == 0 {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    let asked = match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the dimension selects the Texture2D union member.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            (t.MostDetailedMip, t.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the dimension selects the Texture2DArray union member.
+            let t = unsafe { desc.Anonymous.Texture2DArray };
+            (t.MostDetailedMip, t.MipLevels)
+        }
+        _ => return None,
+    };
+    let (first, count) = crate::texture::narrowed(asked, resident, mips);
+    let asked_levels = if asked.1 == 0 || asked.1 == u32::MAX {
+        mips.saturating_sub(asked.0)
+    } else {
+        asked.1
+    };
+    if (first, count) == (asked.0, asked_levels) {
+        return None;
+    }
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: as above.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            *t = D3D12_TEX2D_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                PlaneSlice: t.PlaneSlice,
+                ResourceMinLODClamp: t.ResourceMinLODClamp,
+            };
+        }
+        _ => {
+            // SAFETY: as above.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            *t = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                FirstArraySlice: t.FirstArraySlice,
+                ArraySize: t.ArraySize,
+                PlaneSlice: t.PlaneSlice,
+                ResourceMinLODClamp: t.ResourceMinLODClamp,
+            };
+        }
+    }
+    Some((first, count))
+}
+
+/// Whether a host SRV made with `host_mips` for title view `view` should be
+/// remade because more (or all) streamed levels have arrived.
+fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
+    let Some(texture) = crate::resource::host_resource(title as crate::object::This) else {
+        return false;
+    };
+    // SAFETY: a live resource when this slot still holds it.
+    let rd = unsafe { texture.GetDesc() };
+    let mips = u32::from(rd.MipLevels);
+    let asked = match view {
+        View::Shader(_, Some(w)) => match asked_srv_mips(&srv_desc(w), mips) {
+            Some(a) => a,
+            None => return false,
+        },
+        View::Placed(false, _, desc) => {
+            let words: [u32; 10] = match desc[..10].try_into() {
+                Ok(w) => w,
+                Err(_) => return false,
+            };
+            match asked_srv_mips(&srv_desc(&words), mips) {
+                Some(a) => a,
+                None => return false,
+            }
+        }
+        // Typeless default SRVs synthesize a concrete desc at make time; rebuild
+        // that same asked window so a later widen can remake them (#616).
+        View::Shader(_, None) => {
+            let own = rd.Format.0 as u32;
+            if !is_typeless(own) {
+                return false;
+            }
+            let Some(fmt) = concrete_format_for(title as crate::object::This, own, false) else {
+                return false;
+            };
+            let Some(desc) = default_srv_desc(&rd, fmt) else {
+                return false;
+            };
+            match asked_srv_mips(&desc, mips) {
+                Some(a) => a,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    let want = if crate::texture::is_host_written(title as crate::object::This) {
+        // Host copy owns the full chain; restore the title's asked range.
+        if host_mips != asked {
+            asked
+        } else {
+            return false;
+        }
+    } else {
+        match crate::texture::resident(title as crate::object::This) {
+            Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
+            // Fully mapped (or no longer tracked as partial): the title's range.
+            _ if host_mips != asked => asked,
+            _ => return false,
+        }
+    };
+    want != host_mips
+}
+
+/// `(MostDetailedMip, MipLevels)` a 2D / 2D-array SRV asks for, with `0` /
+/// [`u32::MAX`] levels expanded against the resource mip count.
+fn asked_srv_mips(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, mips: u32) -> Option<(u32, u32)> {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: Texture2D member.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            let levels = if t.MipLevels == 0 || t.MipLevels == u32::MAX {
+                mips.saturating_sub(t.MostDetailedMip)
+            } else {
+                t.MipLevels
+            };
+            Some((t.MostDetailedMip, levels))
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: Texture2DArray member.
+            let t = unsafe { desc.Anonymous.Texture2DArray };
+            let levels = if t.MipLevels == 0 || t.MipLevels == u32::MAX {
+                mips.saturating_sub(t.MostDetailedMip)
+            } else {
+                t.MipLevels
+            };
+            Some((t.MostDetailedMip, levels))
+        }
+        _ => None,
+    }
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -1078,6 +1419,48 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// Host copy range a buffer or constant view reads, for bindless refresh.
+///
+/// Resolves the shadow the same way descriptor creation does (`find` on the
+/// buffer's full base and length), then refreshes only the viewed subrange —
+/// so overlapping title buffers do not pick a different innermost shadow than
+/// the one the descriptor was created against.
+fn buffer_refresh_range(view: &View) -> Option<BufRange> {
+    let is_uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let (base, extent) = buffer_host_extent(view)?;
+    if extent == 0 {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, extent)?;
+    let (address, len) = match *view {
+        View::Constant(address, size) => (address, u64::from(size)),
+        _ => buffer_range(view)?,
+    };
+    if len == 0 {
+        return None;
+    }
+    let len = len.min(shadow.left(address));
+    (len > 0).then_some((shadow, address, len, is_uav))
+}
+
+/// The full title buffer a view was created against: base address and length
+/// passed to [`crate::shadow::find`] when making the host descriptor.
+fn buffer_host_extent(view: &View) -> Option<(u64, u64)> {
+    match view {
+        View::Constant(address, size) => Some((*address, u64::from(*size))),
+        View::Shader(resource, Some(_)) | View::Unordered(resource, _, Some(_)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len))
+        }
+        View::Placed(_, resource, desc) if resource[0] == 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len))
+        }
+        _ => None,
     }
 }
 
@@ -1162,13 +1545,15 @@ enum Kept {
     Resource(ID3D12Resource),
     /// A host texture SRV or UAV, carrying the title `Resource` address and
     /// access kind so [`HostHeap::mirror`] can track it without re-reading the
-    /// title pointer after `make`.
+    /// title pointer after `make`. `host_mips` is the `(MostDetailedMip,
+    /// MipLevels)` the host SRV was made with (`None` for UAVs), so a later
+    /// mirror can remake it when more streamed levels arrive.
     Texture {
         resource: ID3D12Resource,
         title: usize,
         is_uav: bool,
+        host_mips: Option<(u32, u32)>,
     },
-    Unaligned(UnalignedCopy),
     AliasedShadow {
         shadow: Arc<Shadow>,
         address: u64,
@@ -1190,6 +1575,49 @@ fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW
         }
         _ => None,
     }
+}
+
+pub(crate) struct BufferRead {
+    pub(crate) shadow: Arc<crate::shadow::Shadow>,
+    pub(crate) address: u64,
+    pub(crate) bytes: u64,
+    pub(crate) stride: u32,
+}
+
+/// A bounded dword-readable window in the backing buffer. Raw views index
+/// bytes, even though the descriptor expresses its extent in dwords.
+pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
+    let (base, size, desc) = buffer_srv_parts(view)?;
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension selects the Buffer union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let element = element_size(&desc);
+    let stride = if b.Flags == D3D12_BUFFER_SRV_FLAG_RAW {
+        1
+    } else {
+        element.try_into().ok()?
+    };
+    let start = b.FirstElement.checked_mul(element)?;
+    let bytes = u64::from(b.NumElements).checked_mul(element)?;
+    if bytes < 4 || start.checked_add(bytes)? > size {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, size)?;
+    let address = base.checked_add(start)?;
+    let offset = shadow.offset(address);
+    // Reserve the last 16-byte block as an out-of-bounds address even for
+    // four-dword reads. Include the prefix required by raw SRV alignment.
+    if !offset.is_multiple_of(4) || bytes + offset % 16 > u64::from(u32::MAX - 15) {
+        return None;
+    }
+    Some(BufferRead {
+        shadow,
+        address,
+        bytes,
+        stride,
+    })
 }
 
 /// Re-expresses the exact byte start and length of a raw buffer SRV as
@@ -1277,11 +1705,15 @@ fn buffer_srv_inner(
         // The title's placed buffer starts at an address that is not a
         // multiple of `element` inside our larger host shadow buffer (e.g. a
         // non-power-of-two structured element stride inside a ring buffer).
-        // Copy the viewed bytes into a persistently mapped aligned upload
-        // buffer starting at element 0, and track it so draws refresh it from
-        // title memory at submission time.
-        const MAX_UNALIGNED_COPY: u64 = 1 << 20;
-        if bytes == 0 || bytes > MAX_UNALIGNED_COPY {
+        // Give the view its own host copy that starts at the view so elements
+        // land where the title put them. The slot holds it; refresh copies
+        // only the pages the title wrote.
+        //
+        // shortcut: prepared from title memory, so it does not see what a
+        // shader of the same submission wrote in that range before the read.
+        // Getting that right needs host buffer states across the submission.
+        let start = address.checked_add(view_offset)?;
+        if bytes == 0 {
             once!(
                 offset,
                 element,
@@ -1289,21 +1721,18 @@ fn buffer_srv_inner(
             );
             return None;
         }
-        let start = address.checked_add(view_offset)?;
-        let (upload, dst) = host.upload_buffer(bytes)?;
-        crate::host::copy_mapped(dst, start as *const u8, bytes as usize, false);
+        let copy = crate::shadow::aligned(start, bytes)?;
         buffer.FirstElement = 0;
-        // SAFETY: a live upload buffer and a slot of our heap.
+        // SAFETY: a live buffer and a slot of our heap.
         unsafe {
             host.device
-                .CreateShaderResourceView(&upload, Some(&desc), at)
+                .CreateShaderResourceView(&copy.buffer, Some(&desc), at)
         };
-        return Some(Kept::Unaligned(UnalignedCopy {
-            resource: upload,
-            dst: dst as usize,
-            src: start as usize,
-            len: bytes as usize,
-        }));
+        return Some(Kept::AliasedShadow {
+            shadow: copy,
+            address: start,
+            len: bytes,
+        });
     }
     buffer.FirstElement += offset / element;
     if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
@@ -1471,65 +1900,86 @@ fn supports_typed_uav(format: DXGI_FORMAT) -> bool {
 /// multi-plane, block-compressed, and 96-bit `R32G32B32` formats only allow
 /// shader views (`None` for UAVs); every typed UAV format is gated on the host
 /// device's cached `D3D12_FEATURE_FORMAT_SUPPORT` query.
+///
+/// Production null/UNKNOWN resolution goes through [`concrete_format_for`]
+/// (and `null_view_format`); this helper is the direct typeless-family table
+/// used by the unit tests below.
+#[cfg(test)]
 fn default_concrete_format(typeless: u32, unordered: bool) -> Option<u32> {
-    let concrete = match DXGI_FORMAT(typeless as i32) {
-        // Depth-stencil multi-plane (SRV only, plane 0)
-        DXGI_FORMAT_R24G8_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R24_UNORM_X8_TYPELESS)?,
-        DXGI_FORMAT_R32G8X24_TYPELESS => {
-            (!unordered).then_some(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS)?
-        }
-        // Block-compressed (SRV only)
-        DXGI_FORMAT_BC1_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC1_UNORM)?,
-        DXGI_FORMAT_BC2_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC2_UNORM)?,
-        DXGI_FORMAT_BC3_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC3_UNORM)?,
-        DXGI_FORMAT_BC4_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC4_UNORM)?,
-        DXGI_FORMAT_BC5_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC5_UNORM)?,
-        DXGI_FORMAT_BC6H_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC6H_UF16)?,
-        DXGI_FORMAT_BC7_TYPELESS => (!unordered).then_some(DXGI_FORMAT_BC7_UNORM)?,
-        // 96-bit RGB has no typed UAV in D3D12 (SRV only)
-        DXGI_FORMAT_R32G32B32_TYPELESS => (!unordered).then_some(DXGI_FORMAT_R32G32B32_FLOAT)?,
-        // Color (SRV, and UAV when supported by the host device)
-        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
-        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
-        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
-        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
-        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
-        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
-        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
-        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
-        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
-        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
-        _ => return None,
-    };
-    if unordered && !supports_typed_uav(concrete) {
+    let concrete = crate::resource::typeless_default_format(typeless, unordered)?;
+    if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
         return None;
     }
-    Some(concrete.0 as u32)
+    Some(concrete)
 }
 
-/// Resolves the concrete view format for a typeless host texture: preserves the
-/// title's format for sRGB+UAV SRVs (via `view_format`, excluding depth formats
-/// other than mapping `D16_UNORM` to `R16_UNORM`), otherwise uses
-/// [`default_concrete_format`].
+/// Resolves the concrete view format for a typeless host texture when the title
+/// passed a null description or `DXGI_FORMAT_UNKNOWN`: uses [`view_format`] for
+/// textures promoted from a typed console format (sRGB kept on SRVs, mapped to
+/// linear on UAVs; depth mapped to an SRV plane format), else
+/// [`default_concrete_format`]. (#438 VIC-BT-004)
 fn concrete_format_for(
     resource: crate::object::This,
     own: u32,
     unordered: bool,
 ) -> Option<DXGI_FORMAT> {
-    if !unordered && let Some(fmt) = crate::resource::view_format(resource) {
-        if fmt == DXGI_FORMAT_D16_UNORM.0 as u32 {
-            return Some(DXGI_FORMAT_R16_UNORM);
-        }
-        if !crate::resource::DEPTH_FORMATS
-            .iter()
-            .any(|&(d, _)| d == fmt)
-        {
-            return Some(DXGI_FORMAT(fmt as i32));
+    let title = crate::resource::view_format(resource);
+    let concrete = crate::resource::null_view_format(own, title, unordered)?;
+    if unordered && !supports_typed_uav(DXGI_FORMAT(concrete as i32)) {
+        return None;
+    }
+    Some(DXGI_FORMAT(concrete as i32))
+}
+
+/// Rebases a shader view of a title texture onto its host copy, which lacks
+/// the title's top `dropped` mip levels (see `resource::dropped_mips`): the
+/// level range and the minimum LOD clamp name the title's levels.
+fn drop_mips_in_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, dropped: u32) {
+    if dropped == 0 {
+        return;
+    }
+    let rebase = |most: &mut u32, levels: &mut u32, clamp: &mut f32| {
+        (*most, *levels) = crate::resource::rebase_mip_range(*most, *levels, dropped);
+        *clamp = (*clamp - dropped as f32).max(0.0);
+    };
+    // SAFETY: each arm reads the union member the view dimension selects.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let v = &mut desc.Anonymous.Texture2D;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let v = &mut desc.Anonymous.Texture2DArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let v = &mut desc.Anonymous.TextureCube;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let v = &mut desc.Anonymous.TextureCubeArray;
+                rebase(
+                    &mut v.MostDetailedMip,
+                    &mut v.MipLevels,
+                    &mut v.ResourceMinLODClamp,
+                );
+            }
+            _ => {}
         }
     }
-    default_concrete_format(own, unordered).map(|f| DXGI_FORMAT(f as i32))
 }
 
 /// Synthesizes a full SRV description matching `rd` with concrete `format` when
@@ -1690,6 +2140,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Typeless host copies need an explicit concrete format: `make` fills
+    // null / UNKNOWN via `concrete_format_for` before calling here (VIC-BT-004).
     if view == 0 {
         return !typeless;
     }
@@ -1715,6 +2167,72 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// The unordered access view description for a title's view of a depth
+/// texture, made for the texture's colour twin `twin`
+/// ([`crate::resource::Twin`]): the same mip and slices, in the colour
+/// format of the twin's family for a typeless or depth view format.
+/// The twin of a stencil plane (R8) stands for the views of that plane
+/// only: those that name plane 1 or a stencil format. A view of the depth
+/// plane has a twin of its own, viewed as a depth texture's without
+/// stencil: a view of it that names plane 0 or a depth format takes the
+/// twin's colour format too.
+fn twin_uav(
+    twin: &ID3D12Resource,
+    desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+) -> Option<D3D12_UNORDERED_ACCESS_VIEW_DESC> {
+    // SAFETY: a live resource.
+    let d = unsafe { twin.GetDesc() };
+    let mut desc = desc.cloned().unwrap_or_else(|| {
+        let mut all = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        if d.DepthOrArraySize > 1 {
+            all.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            all.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: u32::from(d.DepthOrArraySize),
+                ..Default::default()
+            };
+        }
+        all
+    });
+    // A stencil plane's twin (R8 typeless, 60): the title's view is of the
+    // stencil plane if it names plane 1 or a stencil view format (22, 47).
+    if d.Format.0 == 60 {
+        let mut plane = 0;
+        match desc.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => {
+                // SAFETY: the member the dimension names.
+                let mut view = unsafe { desc.Anonymous.Texture2D };
+                plane = std::mem::take(&mut view.PlaneSlice);
+                desc.Anonymous.Texture2D = view;
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                // SAFETY: the member the dimension names.
+                let mut view = unsafe { desc.Anonymous.Texture2DArray };
+                plane = std::mem::take(&mut view.PlaneSlice);
+                desc.Anonymous.Texture2DArray = view;
+            }
+            _ => {}
+        }
+        if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
+            return None;
+        }
+        desc.Format.0 = 62;
+        return Some(desc);
+    }
+    // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40),
+    // and those of a depth-stencil format's depth plane (19 to 21, 44 to
+    // 46), for the twin of such a plane: the twin's UNORM / float view
+    // formats (R16_UNORM 56, R32_FLOAT 41).
+    desc.Format.0 = match (desc.Format.0, d.Format.0) {
+        (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
+        (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
+        (other, _) => other,
+    };
+    Some(desc)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -1765,6 +2283,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                if let Some(dsc) = desc.as_mut() {
+                    drop_mips_in_srv(dsc, crate::resource::dropped_mips(resource));
+                }
+                // A texture only part of which is mapped (streaming in):
+                // sample the mips that are there, not the zeros of the ones
+                // that are not. The console streams a texture's mips into
+                // place and clamps the level of detail to what arrived; the
+                // host has no clamp but the view's window. Remember the
+                // narrowed window so a later mirror can widen it.
+                let host_mips = desc
+                    .as_mut()
+                    .and_then(|d| narrow_to_resident(resource, texture, d));
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -1777,6 +2307,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     resource: texture.clone(),
                     title: resource as usize,
                     is_uav: false,
+                    host_mips,
                 })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1812,6 +2343,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     }
                 }
             }
+            // A depth texture's unordered access is its colour twin's: the
+            // host gives a depth texture none.
+            let twin = crate::resource::twin_resource(resource)
+                .and_then(|twin| Some((twin, twin_uav(twin, desc.as_ref())?)))
+                // A view of the depth plane of a texture with a stencil
+                // plane: of that plane's own twin.
+                .or_else(|| {
+                    let twin = crate::resource::twin_plane_resource(resource)?;
+                    Some((twin, twin_uav(twin, desc.as_ref())?))
+                });
+            let texture = match twin {
+                Some((twin, view)) => {
+                    desc = Some(view);
+                    twin
+                }
+                None => texture,
+            };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
@@ -1828,6 +2376,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 resource: texture.clone(),
                 title: resource as usize,
                 is_uav: true,
+                host_mips: None,
             })
         }
         View::Sampler(words) => {
@@ -1853,12 +2402,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
+                // A texture the title placed itself with no host resource at
+                // its address stays unmirrored: null, as before.
                 once!(
                     dimension = resource[0],
-                    "placed unordered texture view not mirrored"
+                    unordered = *unordered,
+                    "placed texture view not mirrored"
                 );
                 return None;
             }
@@ -1875,19 +2424,38 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// First mip sampled by a shader view the title placed over a single 2D texture.
+pub(crate) fn placed_first_mip(view: &View) -> u32 {
+    let View::Placed(false, _, words) = view else {
+        return 0;
+    };
+    let desc = srv_desc(words[..10].try_into().unwrap());
+    if desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+        // SAFETY: the dimension selects the Texture2D union member.
+        unsafe { desc.Anonymous.Texture2D.MostDetailedMip }
+    } else {
+        0
+    }
+}
+
+/// Resolves a placed texture's SRV or UAV to the resource created at its
+/// address (the resource is made on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-    let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let texture = crate::resource::texture_at(address, resource)? as usize;
+    let desc = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture, 0, desc)
+    } else {
+        View::Shader(texture, desc)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -1913,6 +2481,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
+        // shortcut: the title's null SRV at heap slot 0 is one of these
+        // (resource 0 with a texture desc). Slot 0 is also read as a CBV
+        // through a computed heap index; a single host descriptor cannot be
+        // both an SRV and a CBV, so the translator skips heap-direct CBV
+        // loads at index 0 rather than asking for a null CBV here (#485).
         View::Shader(_, Some(desc)) => return null_like(desc, at),
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
@@ -2134,6 +2707,39 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// The title's null SRV at heap slot 0 is a texture view of no resource.
+    /// It must stay an SRV (not a null CBV): slot 0 is also sampled as an
+    /// SRV, and a single host descriptor cannot satisfy both kinds (#485).
+    #[test]
+    fn title_null_srv_at_slot_zero_stays_an_srv() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // Format R32_UINT, TEXTURE1D, default component mapping — the shape
+        // reported for the title's null SRV at heap slot 0.
+        let view = View::Shader(
+            0,
+            Some([
+                42,
+                2,
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ]),
+        );
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Buffer views of no elements (the title makes them for buffers it has
     /// not sized yet) are left null: the host removes the device for one.
     #[test]
@@ -2216,9 +2822,8 @@ mod tests {
     }
 
     /// A structured buffer SRV whose offset inside its shadow buffer is not a
-    /// multiple of its element stride is copied into an aligned upload buffer
-    /// and refreshed from title memory when a command list referencing the slot
-    /// is submitted.
+    /// multiple of its element stride reads its own aligned host copy, refreshed
+    /// from title memory when a command list referencing the slot is submitted.
     #[test]
     fn unaligned_structured_buffer_srv_refreshes_on_submission() {
         let Some(host) = host() else {
@@ -2246,9 +2851,13 @@ mod tests {
         };
         let kept = buffer_srv(base + 32, 24, desc, heap.cpu(0))
             .expect("unaligned structured SRV should succeed");
-        let (upload, dst) = match &kept {
-            Kept::Unaligned(copy) => (copy.resource.clone(), copy.dst as *const u8),
-            _ => panic!("expected an unaligned upload copy"),
+        let (copy, start, len) = match &kept {
+            Kept::AliasedShadow {
+                shadow,
+                address,
+                len,
+            } => (shadow.clone(), *address, *len),
+            _ => panic!("expected an aligned view copy"),
         };
         heap.keep(0, kept);
 
@@ -2262,14 +2871,10 @@ mod tests {
         host.execute(&[&list]);
         crate::shadow::unregister(base as usize, base);
 
-        // SAFETY: `upload` is persistently mapped for its lifetime (`24` bytes)
-        // and `host.execute` has completed.
-        unsafe {
-            assert_eq!(upload.GetDesc().Width, 24);
-            let got = std::slice::from_raw_parts(dst, 24);
-            assert_eq!(got, &updated);
-            assert!(host.device.GetDeviceRemovedReason().is_ok());
-        }
+        let got = copy.bytes(start, len).expect("view bytes inside its copy");
+        assert_eq!(got, &updated);
+        // SAFETY: queries the live host device's removal status only.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     struct OwnedObject(crate::object::This);
@@ -2806,7 +3411,7 @@ mod tests {
             let (g, s, u) = host_heap.live_textures(srvs, uavs);
             (
                 g,
-                s.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
+                s.iter().map(|(h, _)| h.get() as usize).collect::<Vec<_>>(),
                 u.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
             )
         };
@@ -2925,25 +3530,176 @@ mod tests {
     }
 
     #[test]
+    fn direct_heap_byte_copies_are_mirrored_and_tracked() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let tex_a = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let tex_b = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let addr_a = tex_a.0 as usize;
+        let addr_b = tex_b.0 as usize;
+
+        let mut cpu_staging = [0u64; 2 * 4];
+        let src_a = cpu_staging.as_mut_ptr() as u64;
+        let src_b = src_a + 32;
+        crate::descriptor::create_srv(std::ptr::null(), tex_a.0, std::ptr::null(), src_a);
+        crate::descriptor::create_srv(std::ptr::null(), tex_b.0, std::ptr::null(), src_b);
+
+        // 1. Plain (non-write-watched) shader-visible heap: pre-init direct copy,
+        //    post-init direct copy, overwrite, and zero-clear.
+        let plain_heap = make_view_heap(16);
+        let plain = crate::descriptor::heap(plain_heap.0);
+        let plain_slot = |i: u32| plain.start + u64::from(i) * 32;
+
+        // Direct byte copy BEFORE `Heap::host()` exists.
+        // SAFETY: both pointers reference live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(src_a as *const u8, plain_slot(2) as *mut u8, 32) };
+        let plain_host = plain.host().expect("plain host view heap");
+        assert!(plain_host.live_texture_addrs(true, false).1.is_empty());
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert_eq!(plain_host.live_texture_addrs(true, false).1, vec![addr_a]);
+        assert_eq!(plain.sync_direct_copies(true), 0);
+
+        // Overwrite slot 2 directly with `tex_b`, then clear it to zeroes.
+        // SAFETY: both pointers reference live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(src_b as *const u8, plain_slot(2) as *mut u8, 32) };
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert_eq!(plain_host.live_texture_addrs(true, false).1, vec![addr_b]);
+
+        // SAFETY: slot 2 lies inside the live 16-slot view heap.
+        unsafe { std::ptr::write_bytes(plain_slot(2) as *mut u8, 0, 32) };
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert!(plain_host.live_texture_addrs(true, false).1.is_empty());
+
+        // 2. Write-watched placed shader-visible heap spanning two 64 KiB pages
+        //    (4096 slots * 32 bytes = 128 KiB).
+        struct WatchedMemory(*mut u8);
+        impl Drop for WatchedMemory {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: allocated by `VirtualAlloc` below.
+                    unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+                }
+            }
+        }
+        const SLOTS: u32 = 4096;
+        const BYTES: usize = SLOTS as usize * 32;
+        // SAFETY: requests a fresh zeroed 128 KiB write-watched region.
+        let mem = WatchedMemory(unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BYTES,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast()
+        });
+        assert!(!mem.0.is_null(), "VirtualAlloc(MEM_WRITE_WATCH) failed");
+
+        #[repr(C)]
+        struct PlacedDesc {
+            desc: [u32; 4],
+            placement: [u64; 2],
+        }
+        let placed = PlacedDesc {
+            desc: [0, SLOTS, 1, 0],
+            placement: [mem.0 as u64, BYTES as u64],
+        };
+        let mut raw_heap: crate::object::This = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&placed).cast(),
+                &crate::object::guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                ),
+                &mut raw_heap,
+            ),
+            crate::object::S_OK
+        );
+        let watched_heap = OwnedObject(raw_heap);
+        let watched = crate::descriptor::heap(watched_heap.0);
+        assert_eq!(watched.start, mem.0 as u64);
+        let watched_slot = |i: u32| watched.start + u64::from(i) * 32;
+
+        // Copy `tex_a` directly into slot 5 (page 0) before `host()` is created.
+        // SAFETY: slot 5 lies within the 4096-slot placed heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_a as *const u8, watched_slot(5) as *mut u8, 32)
+        };
+        let watched_host = watched.host().expect("watched host view heap");
+        assert_eq!(watched.sync_direct_copies(true), 1);
+        assert_eq!(watched_host.live_texture_addrs(true, false).1, vec![addr_a]);
+        // Clean sync scans zero dirty pages.
+        assert_eq!(watched.sync_direct_copies(true), 0);
+
+        // Direct copy into slot 2050 (second 64 KiB page) is picked up by `sync_all_heaps`.
+        // SAFETY: slot 2050 lies within the 4096-slot placed heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_b as *const u8, watched_slot(2050) as *mut u8, 32);
+        }
+        crate::descriptor::sync_all_heaps();
+        let mut live = watched_host.live_texture_addrs(true, false).1;
+        live.sort_unstable();
+        let mut expected = vec![addr_a, addr_b];
+        expected.sort_unstable();
+        assert_eq!(live, expected);
+        assert_eq!(watched.sync_direct_copies(true), 0);
+
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
     fn bindless_tracker_forget_is_aba_safe_when_pointer_reused() {
         let Some(heap) = HostHeap::new(false, 16) else {
             return; // no host GPU
         };
         let reused_addr = 0x1234_5678usize;
         // Resource A mirrored at slot 5, then released without rewriting slot 5.
-        heap.track_slot(5, Some((reused_addr, false)));
+        heap.track_slot(5, Some((reused_addr, false, 8)));
+        heap.track_slot(6, Some((reused_addr, false, 3)));
+        let first = || heap.tex_tracker.lock().unwrap().first_mip(reused_addr);
+        assert_eq!(first(), 3);
+        heap.track_slot(6, Some((reused_addr, false, 5)));
+        assert_eq!(first(), 5);
+        heap.track_slot(6, None);
+        assert_eq!(first(), 8);
         assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
         heap.forget_resource(reused_addr);
         assert!(heap.live_texture_addrs(true, false).1.is_empty());
         // New resource B allocated at the same pointer and mirrored into slot 7.
-        heap.track_slot(7, Some((reused_addr, false)));
+        heap.track_slot(7, Some((reused_addr, false, 0)));
         // Later, stale slot 5 is overwritten with null/another view: slot 7 stays live!
         heap.track_slot(5, None);
         assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
         // And UAV slots share the same ABA guarantee.
-        heap.track_slot(2, Some((reused_addr, true)));
+        heap.track_slot(2, Some((reused_addr, true, 0)));
         heap.forget_resource(reused_addr);
-        heap.track_slot(9, Some((reused_addr, true)));
+        heap.track_slot(9, Some((reused_addr, true, 0)));
         heap.track_slot(2, None);
         assert_eq!(heap.live_texture_addrs(false, true).2, vec![reused_addr]);
     }
@@ -2960,7 +3716,7 @@ mod tests {
         // Simulate a `View::Placed` texture tracked in `HostHeap::tex_tracker`
         // that never had an entry in `descriptor::VIEWS.by_resource`.
         let placed_addr = 0xfeed_face_0000usize;
-        host_heap.track_slot(3, Some((placed_addr, false)));
+        host_heap.track_slot(3, Some((placed_addr, false, 0)));
         assert_eq!(
             host_heap.live_texture_addrs(true, false).1,
             vec![placed_addr]
@@ -3147,6 +3903,60 @@ mod structured_alias_tests {
         assert!(!heap.make_structured_at(dyn_idx, &v, 64));
     }
 
+    /// Buffer views mirrored for draws are tracked and refreshed when a
+    /// ResourceDescriptorHeap path asks; deferred (non-draw) mirrors are not.
+    #[test]
+    fn bindless_buffer_views_are_tracked_and_refreshed() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let mut backing = vec![0u8; 4096];
+        backing[..16].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let base = backing.as_ptr() as u64;
+        let _guard = ShadowGuard {
+            resource: base as usize,
+            address: base,
+        };
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let mut slot = [0u64; 16];
+        // 64 dwords from element 0: a 256-byte raw view of the buffer start.
+        let handle = placed_raw_srv_handle(&mut slot, base, 256, 0, 64);
+
+        assert!(heap.mirror(0, handle, false).is_some());
+        assert_eq!(
+            heap.live_buffer_count(),
+            0,
+            "deferred buffer mirrors must not track yet"
+        );
+
+        assert!(heap.mirror(0, handle, true).is_some());
+        assert_eq!(
+            heap.live_buffer_count(),
+            1,
+            "draw-time mirror must track the buffer range"
+        );
+
+        backing[..16].fill(0xAB);
+        let list = host.new_list().expect("host list");
+        heap.refresh_bindless_buffers(&list);
+        list.close();
+        host.execute(&[&list]);
+
+        let shadow = crate::shadow::find(base, 16).expect("shadow");
+        assert_eq!(
+            shadow.bytes(base, 16).expect("mapped"),
+            &[0xAB; 16],
+            "bindless refresh must copy title writes into the host copy"
+        );
+
+        heap.make_null(0);
+        assert_eq!(heap.live_buffer_count(), 0);
+    }
+
     #[test]
     fn structured_alias_reads_exact_records_with_sentinel_and_mutation_checks() {
         use windows::Win32::Foundation::CloseHandle;
@@ -3318,16 +4128,17 @@ void main() {
             );
 
             // Mutate dword 17 after creating the alias to prove submission-time
-            // refresh updates the backing resource (shadow or UnalignedCopy).
+            // refresh updates the backing resource (buffer shadow or the view's
+            // own aligned copy).
             let mutated_word = tag | 0x00FF_0011;
             write_word(&mut backing, rec_off + 17 * 4, mutated_word);
 
             let list = host.new_list().expect("host list");
             assert!(heap.refresh_slot(dyn_idx, &list));
             if placed_off % 64 != 0 {
-                // `dyn_idx` reads an `UnalignedCopy` upload buffer rather than `shadow`,
-                // so refresh `canonical_raw`'s first record word independently to check
-                // canonical slot 0's raw readback too.
+                // `dyn_idx` reads the view's own aligned copy rather than the
+                // buffer shadow, so refresh the canonical raw slot's first
+                // record word independently for its readback check.
                 crate::shadow::find(base + rec_off as u64, 4)
                     .expect("registered shadow")
                     .refresh(&list, base + rec_off as u64, 4);
