@@ -1346,7 +1346,6 @@ mod tests {
     #[test]
     fn inline_cbvs_round_trip_without_growing_view_table() {
         let null = std::ptr::null();
-        let before = VIEWS.read().unwrap_or_else(|e| e.into_inner()).list.len();
         let mut slots = [0u64; 16];
         let base = slots.as_mut_ptr() as u64;
         let at = |i: usize| base + 32 * i as u64;
@@ -1369,11 +1368,15 @@ mod tests {
             assert_eq!(raw[2] >> KIND_SHIFT, KIND_CONSTANT);
             assert_ne!(raw[2], VIEW_TAG);
         }
-        let after_inline = VIEWS.read().unwrap_or_else(|e| e.into_inner()).list.len();
-        assert_eq!(
-            after_inline, before,
-            "inline CBVs must not insert into VIEWS"
-        );
+        {
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            for &(addr, size) in &inline_cases {
+                assert!(
+                    !views.index.contains_key(&View::Constant(addr, size)),
+                    "inline CBV ({addr:#x}, {size}) must not insert into VIEWS"
+                );
+            }
+        }
 
         // Unaligned size >= 16 KiB or address >= 2^47 falls back to the table.
         let fallback_cases = [
@@ -1387,6 +1390,15 @@ mod tests {
             // SAFETY: slot 0 lies inside `slots`.
             let raw = unsafe { *(at(0) as *const [u32; 3]) };
             assert_eq!(raw[2] >> KIND_SHIFT, 0);
+        }
+        {
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            for &(addr, size) in &fallback_cases {
+                assert!(
+                    views.index.contains_key(&View::Constant(addr, size)),
+                    "fallback CBV ({addr:#x}, {size}) must be stored in VIEWS"
+                );
+            }
         }
     }
 

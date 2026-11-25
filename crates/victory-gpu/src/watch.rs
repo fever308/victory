@@ -780,6 +780,13 @@ mod tests {
             )
             .is_none()
         );
+        // Clear journal entries before releasing `p` so a parallel test that
+        // receives the same virtual address does not inherit stale writes.
+        let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        for page in start / PAGE..end / PAGE {
+            journal.written.remove(&page);
+        }
+        drop(journal);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -818,6 +825,13 @@ mod tests {
                 unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
             }
         };
+        // A previous test may have used these virtual addresses.
+        {
+            let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in a / PAGE..(b + 2 * PAGE) / PAGE {
+                journal.written.remove(&page);
+            }
+        }
         let _ = writes(a, b + 2 * PAGE, false);
         // SAFETY: committed pages of ours.
         unsafe {

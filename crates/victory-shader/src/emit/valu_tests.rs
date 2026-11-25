@@ -1834,6 +1834,88 @@ fn v_mad_f32_flushes_subnormals_around_omod() {
     }
 }
 
+/// `v_mad_u32_u16` / `v_mad_i32_i16` (op_sel halves) and `v_lerp_u8` (#405).
+#[test]
+fn mad_u32_u16_i32_i16_and_lerp_u8() {
+    let vop3_opsel = |op: u16, vdst: u8, s0: u16, s1: u16, s2: u16, opsel: u8| -> [u32; 2] {
+        let [w0, w1] = vop3(op, vdst, s0, s1, s2);
+        [w0 | (u32::from(opsel) << 11), w1]
+    };
+
+    // v_mad_u32_u16 v0, v1, v2, v3
+    let mad_u = build_valu_cs(&vop3(0x373, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // opsel[0:1] = high halves of src0/src1
+    let mad_u_hi = build_valu_cs(&vop3_opsel(0x373, 0, vgpr(1), vgpr(2), vgpr(3), 0b0011));
+    // v_mad_i32_i16 v0, v1, v2, v3
+    let mad_i = build_valu_cs(&vop3(0x375, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mad_i_hi = build_valu_cs(&vop3_opsel(0x375, 0, vgpr(1), vgpr(2), vgpr(3), 0b0011));
+    // v_lerp_u8 v0, v1, v2, v3
+    let lerp = build_valu_cs(&vop3(0x14d, 0, vgpr(1), vgpr(2), vgpr(3)));
+
+    let mad_u_cases: &[([u32; 4], u32)] = &[
+        ([3, 5, 7, 0], 3 * 5 + 7),
+        ([0x0001_0003, 0x0002_0005, 7, 0], 3 * 5 + 7),
+        // wrap: 0xFFFF * 0xFFFF + 1 = 0xFFFE_0002
+        ([0xFFFF, 0xFFFF, 1, 0], 0xFFFE_0002),
+    ];
+    let mad_u_hi_cases: &[([u32; 4], u32)] = &[
+        // hi(0x0004_xxxx)=4, hi(0x0006_xxxx)=6 → 4*6+7
+        ([0x0004_0003, 0x0006_0005, 7, 0], 4 * 6 + 7),
+        ([0xFFFF_0001, 0x0002_FFFF, 0, 0], 0xFFFF * 2),
+    ];
+    let mad_i_cases: &[([u32; 4], u32)] = &[
+        ([3, 5, 7, 0], 22),
+        // (-2) * 3 + 1 = -5
+        ([0xFFFE, 3, 1, 0], (-5i32) as u32),
+        // (-1) * (-1) + 0 = 1
+        ([0xFFFF, 0xFFFF, 0, 0], 1),
+        // wrap: 0x8000 * 0x8000 = 0x4000_0000; + 0xC000_0000 wraps
+        ([0x8000, 0x8000, 0xC000_0000, 0], 0),
+    ];
+    let mad_i_hi_cases: &[([u32; 4], u32)] = &[
+        // hi 0xFFFE (-2) * hi 0x0003 (3) + 1 = -5
+        ([0xFFFE_0001, 0x0003_FFFF, 1, 0], (-5i32) as u32),
+    ];
+    // Per byte: (a + b + (c & 1)) >> 1
+    let lerp_cases: &[([u32; 4], u32)] = &[
+        (
+            [0x03_02_01_00, 0x07_06_05_04, 0x00_00_00_00, 0],
+            0x05_04_03_02,
+        ),
+        // Rounding bit lifts odd sums: (1+0+1)>>1 = 1 vs (1+0+0)>>1 = 0.
+        (
+            [0x00_00_00_01, 0x00_00_00_00, 0x00_00_00_01, 0],
+            0x00_00_00_01,
+        ),
+        // byte0: (1+2+1)>>1=2; byte1: (3+4+1)>>1=4; byte2: (5+6+0)>>1=5; byte3: (7+8+1)>>1=8
+        (
+            [0x07_05_03_01, 0x08_06_04_02, 0x01_00_01_01, 0],
+            0x08_05_04_02,
+        ),
+        (
+            [0xFF_00_80_40, 0x01_00_80_40, 0x01_01_00_00, 0],
+            0x80_00_80_40,
+        ),
+    ];
+
+    for (shader, cases, what) in [
+        (&mad_u, mad_u_cases, "v_mad_u32_u16"),
+        (&mad_u_hi, mad_u_hi_cases, "v_mad_u32_u16 opsel hi"),
+        (&mad_i, mad_i_cases, "v_mad_i32_i16"),
+        (&mad_i_hi, mad_i_hi_cases, "v_mad_i32_i16 opsel hi"),
+        (&lerp, lerp_cases, "v_lerp_u8"),
+    ] {
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(shader, &inputs, |backend, i, _, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
 /// VOP3 integer `clamp` saturates unsigned add/sub on overflow/underflow
 /// (VIC-BT-010). Without the fix these refuse to lower, or wrap.
 #[test]
