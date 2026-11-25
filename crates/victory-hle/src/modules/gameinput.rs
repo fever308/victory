@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use super::release_ref;
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
-use super::xgameruntime::{HRESULT, S_OK};
+use super::xgameruntime::{E_NOINTERFACE, E_POINTER, Guid, HRESULT, IID_IUNKNOWN, S_OK};
 use crate::{HleExport, HleModule};
 
 /// The documented errors.
@@ -27,9 +27,26 @@ pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
-const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
-const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
-const IID_IUNKNOWN: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46];
+
+/// Public GameInput v0 interface ids (GDK `GameInput.h`).
+const IID_IGAMEINPUT: Guid = Guid::new(
+    0x11BE_2A7E,
+    0x4254,
+    0x445A,
+    [0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18],
+);
+const IID_IGAMEINPUT_DEVICE: Guid = Guid::new(
+    0x31DD_86FB,
+    0x4C1B,
+    0x408A,
+    [0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25],
+);
+const IID_IGAMEINPUT_READING: Guid = Guid::new(
+    0x2156_947A,
+    0xE1FA,
+    0x4DE0,
+    [0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D, 0xBD, 0x8D],
+);
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -127,6 +144,11 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Virtual keys `VICTORY_KEYS` holds down now (diagnostics builds only);
+    /// `keys` reports them too.
+    fn scripted(&mut self) -> Vec<u8> {
+        Vec::new()
+    }
     /// Motor speeds for the pad in host slot `slot`; a host without
     /// trigger motors drops those two.
     fn rumble(&mut self, slot: usize, motors: Motors);
@@ -151,6 +173,21 @@ fn fallback(keys: &[KeyState]) -> PadState {
         left_y: on(b'W') - on(b'S'),
         right_x: on(b'L') - on(b'J'),
         right_y: on(b'I') - on(b'K'),
+    }
+}
+
+/// `pad` with the stand-in pad's reading of `keys` pressed on top of it.
+fn press(pad: PadState, keys: &[KeyState]) -> PadState {
+    let extra = fallback(keys);
+    let stick = |a: f32, b: f32| (a + b).clamp(-1.0, 1.0);
+    PadState {
+        buttons: pad.buttons | extra.buttons,
+        left_trigger: pad.left_trigger.max(extra.left_trigger),
+        right_trigger: pad.right_trigger.max(extra.right_trigger),
+        left_x: stick(pad.left_x, extra.left_x),
+        left_y: stick(pad.left_y, extra.left_y),
+        right_x: stick(pad.right_x, extra.right_x),
+        right_y: stick(pad.right_y, extra.right_y),
     }
 }
 
@@ -346,6 +383,8 @@ struct State {
     queue: VecDeque<Event>,
     /// The one thread draining `queue`; other producers only append.
     deliverer: Option<ThreadId>,
+    /// The scripted keys of the last poll, to log each new press once.
+    scripted: Vec<u8>,
 }
 
 pub struct Hub {
@@ -392,6 +431,7 @@ impl Hub {
                 running: Vec::new(),
                 queue: VecDeque::new(),
                 deliverer: None,
+                scripted: Vec::new(),
             }),
             returned: Condvar::new(),
         }));
@@ -424,12 +464,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, scripted) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            (pads, source.keys(), source.scripted())
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, scripted);
         self.deliver(events);
     }
 
@@ -516,12 +556,38 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        mut pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: Vec<u8>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        // Scripted keys press the pad the title reads. With no host pad that
+        // is the stand-in, which has them from `keys`. A host pad hides the
+        // stand-in (a receiver answers for its switched-off pad too), so
+        // they press the first one.
+        let target = pads.iter().position(Option::is_some).unwrap_or(FALLBACK);
+        if !scripted.is_empty()
+            && let Some(pad) = pads.get_mut(target).and_then(Option::as_mut)
+        {
+            let keys: Vec<KeyState> = scripted
+                .iter()
+                .map(|&virtual_key| KeyState {
+                    virtual_key,
+                    ..Default::default()
+                })
+                .collect();
+            *pad = press(*pad, &keys);
+        }
+        if scripted.iter().any(|vk| !self.scripted.contains(vk)) {
+            tracing::info!(
+                virtual_keys = format_args!("{scripted:02x?}"),
+                device = target,
+                "scripted keys pressed"
+            );
+        }
+        self.scripted = scripted;
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
@@ -640,17 +706,21 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
     }
 }
 
-fn query_iunknown<T>(
+/// `QueryInterface` for an input object: `IID_IUnknown` and the object's own
+/// interface id succeed (`AddRef`, `S_OK`); anything else clears `*out`.
+fn query_iid<T>(
     this: *const T,
-    iid: *const [u8; 16],
+    iid: *const Guid,
     out: Out,
     retain: extern "system" fn(*const T) -> u32,
+    self_iid: &Guid,
 ) -> HRESULT {
     if iid.is_null() || out.is_null() {
         return fail(out, E_POINTER);
     }
     // SAFETY: the caller passes a readable IID, checked non-null above.
-    if unsafe { *iid } != IID_IUNKNOWN {
+    let asked = unsafe { *iid };
+    if asked != IID_IUNKNOWN && asked != *self_iid {
         return fail(out, E_NOINTERFACE);
     }
     retain(this);
@@ -659,8 +729,11 @@ fn query_iunknown<T>(
     S_OK
 }
 
-extern "system" fn query_interface(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
-    query_iunknown(this, iid, out, add_ref)
+extern "system" fn query_interface(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_iid(this, iid, out, add_ref, &IID_IGAMEINPUT)
+}
+extern "system" fn device_query(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_iid(this, iid, out, add_ref, &IID_IGAMEINPUT_DEVICE)
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -1043,7 +1116,7 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
 }
 
 static DEVICE: Table<21> = Table([
-    query_interface as *const (),     // 0x00
+    device_query as *const (),        // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
@@ -1070,8 +1143,14 @@ fn reading<'a>(this: *const Reading) -> &'a Reading {
     // SAFETY: a reading we handed out and the title still holds.
     unsafe { &*this }
 }
-extern "system" fn reading_query(this: *const c_void, iid: *const [u8; 16], out: Out) -> HRESULT {
-    query_iunknown(this.cast(), iid, out, reading_add_ref)
+extern "system" fn reading_query(this: *const c_void, iid: *const Guid, out: Out) -> HRESULT {
+    query_iid(
+        this.cast(),
+        iid,
+        out,
+        reading_add_ref,
+        &IID_IGAMEINPUT_READING,
+    )
 }
 extern "system" fn reading_add_ref(this: *const Reading) -> u32 {
     reading(this).refs.fetch_add(1, Ordering::Relaxed) + 1
@@ -1305,6 +1384,11 @@ mod host {
                 .collect()
         }
 
+        #[cfg(feature = "diagnostics")]
+        fn scripted(&mut self) -> Vec<u8> {
+            scripted()
+        }
+
         // shortcut: trigger motors are dropped (XInput has none). The host
         // API that drives them without a redistributable is
         // Windows.Gaming.Input (WinRT `Gamepad.Vibration`), which needs WinRT
@@ -1322,40 +1406,146 @@ mod host {
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// `Left`, `Right` (the stand-in pad's table maps them to buttons, on the
+    /// stand-in or, while one is connected, on the first host pad).
+    ///
+    /// `VICTORY_KEYS_FILE=<path>` also presses each key named on a line of
+    /// that file, read while the title runs, so a person or a script can
+    /// append keys as screens appear instead of guessing load times.
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
+                    key_code(key.trim())?,
                 ))
             });
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+        let mut down: Vec<u8> = keys
+            .iter()
+            .filter(|&&(at, _)| (at..at + KEY_HOLD).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(key_file());
+        down
+    }
+
+    /// How long a scripted key stays down.
+    #[cfg(feature = "diagnostics")]
+    const KEY_HOLD: Duration = Duration::from_millis(200);
+    /// How long `VICTORY_KEYS_FILE` waits between keys, so each reads as a
+    /// separate press.
+    #[cfg(feature = "diagnostics")]
+    const KEY_GAP: Duration = Duration::from_millis(200);
+
+    /// The key `VICTORY_KEYS_FILE` holds down now, reading the file at most
+    /// every 0.1 s.
+    #[cfg(feature = "diagnostics")]
+    fn key_file() -> Option<u8> {
+        struct File {
+            path: Option<std::path::PathBuf>,
+            feed: KeyFeed,
+            read_at: Option<Instant>,
+        }
+        static FILE: LazyLock<Mutex<File>> = LazyLock::new(|| {
+            Mutex::new(File {
+                path: std::env::var_os("VICTORY_KEYS_FILE").map(Into::into),
+                feed: KeyFeed::default(),
+                read_at: None,
+            })
+        });
+        let mut file = FILE.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = file.path.clone()?;
+        let now = Instant::now();
+        if file
+            .read_at
+            .is_none_or(|at| now - at >= Duration::from_millis(100))
+        {
+            file.read_at = Some(now);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                file.feed.feed(&text);
+            }
+        }
+        file.feed.key(now)
+    }
+
+    /// Keys named one per line in a growing text, pressed one at a time.
+    #[cfg(feature = "diagnostics")]
+    #[derive(Default)]
+    struct KeyFeed {
+        /// Bytes of the text already turned into keys.
+        read: usize,
+        queue: VecDeque<u8>,
+        /// The key pressed last and when.
+        pressed: Option<(Instant, u8)>,
+    }
+
+    #[cfg(feature = "diagnostics")]
+    impl KeyFeed {
+        /// Queues the keys on the whole lines of `text` past those already
+        /// read; a line still being written waits for its newline.
+        fn feed(&mut self, text: &str) {
+            let Some(new) = text.get(self.read..) else {
+                return;
+            };
+            let whole = new.rfind('\n').map_or(0, |i| i + 1);
+            self.read += whole;
+            for name in new[..whole].lines().map(str::trim) {
+                match key_code(name) {
+                    Some(vk) => {
+                        tracing::info!(key = name, "VICTORY_KEYS_FILE key queued");
+                        self.queue.push_back(vk);
+                    }
+                    None if !name.is_empty() => {
+                        tracing::warn!(key = name, "VICTORY_KEYS_FILE key unknown");
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        /// The key down at `now`: each queued key for `KEY_HOLD`, then
+        /// nothing for `KEY_GAP`.
+        fn key(&mut self, now: Instant) -> Option<u8> {
+            if let Some((at, vk)) = self.pressed {
+                let since = now.saturating_duration_since(at);
+                if since < KEY_HOLD {
+                    return Some(vk);
+                }
+                if since < KEY_HOLD + KEY_GAP {
+                    return None;
+                }
+                self.pressed = None;
+            }
+            let vk = self.queue.pop_front()?;
+            self.pressed = Some((now, vk));
+            Some(vk)
+        }
+    }
+
+    /// The virtual key a scripted key name stands for.
+    #[cfg(feature = "diagnostics")]
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
     }
 
     /// The keyboard state `ToUnicodeEx` reads with the keys `held` down:
@@ -1491,6 +1681,38 @@ mod host {
         assert_eq!(typed(0x0D, &[0x0D]), (0x0D, false));
         assert_eq!(typed(0x70, &[0x70]), (0, false));
     }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn key_file_presses_whole_lines_one_key_at_a_time() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut feed = KeyFeed::default();
+        // The last line has no newline yet; an unknown name is skipped.
+        let mut text = String::from("Down\nNope\n\nDo");
+        feed.feed(&text);
+        assert_eq!(feed.key(at(0)), Some(0x28));
+        assert_eq!(feed.key(at(199)), Some(0x28));
+        assert_eq!(feed.key(at(200)), None);
+        assert_eq!(feed.key(at(400)), None, "nothing queued after the gap");
+        text.push_str("wn\nEnter\nx\n");
+        feed.feed(&text);
+        feed.feed(&text);
+        let pressed: Vec<_> = (400..2000)
+            .step_by(100)
+            .map(|ms| feed.key(at(ms)))
+            .collect();
+        let d = Some(0x28);
+        let e = Some(0x0D);
+        let x = Some(b'X');
+        #[rustfmt::skip]
+        assert_eq!(pressed, [
+            d, d, None, None,
+            e, e, None, None,
+            x, x, None, None,
+            None, None, None, None,
+        ]);
+    }
 }
 
 #[cfg(test)]
@@ -1507,6 +1729,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        scripted: Vec<u8>,
         rumble: Vec<(usize, Motors)>,
     }
 
@@ -1518,6 +1741,9 @@ mod tests {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
+        }
+        fn scripted(&mut self) -> Vec<u8> {
+            self.0.lock().unwrap().scripted.clone()
         }
         fn rumble(&mut self, slot: usize, motors: Motors) {
             self.0.lock().unwrap().rumble.push((slot, motors));
@@ -1650,8 +1876,8 @@ mod tests {
     }
 
     #[test]
-    fn query_interface_returns_iunknown_and_retains_the_reading() {
-        type Query = extern "system" fn(*const c_void, *const [u8; 16], Out) -> HRESULT;
+    fn query_interface_returns_iunknown_own_iid_and_retains_the_reading() {
+        type Query = extern "system" fn(*const c_void, *const Guid, Out) -> HRESULT;
         let (hub, _) = fake();
         let reading = Ref::new(Reading {
             vtable: &READING,
@@ -1662,16 +1888,29 @@ mod tests {
             value: Value::Pad(PadState::default()),
         });
         let reading_ptr = reading.0.as_ptr().cast_const();
-        for object in [
-            std::ptr::from_ref(&hub.object).cast(),
-            std::ptr::from_ref(&hub.devices[FALLBACK]).cast(),
-            reading_ptr.cast(),
-        ] {
+        let cases = [
+            (std::ptr::from_ref(&hub.object).cast(), &IID_IGAMEINPUT),
+            (
+                std::ptr::from_ref(&hub.devices[FALLBACK]).cast(),
+                &IID_IGAMEINPUT_DEVICE,
+            ),
+            (reading_ptr.cast(), &IID_IGAMEINPUT_READING),
+        ];
+        for (object, self_iid) in cases {
             let query = slot::<Query, _>(object, 0);
             let mut out = std::ptr::null();
             assert_eq!(query(object, &IID_IUNKNOWN, &mut out), S_OK);
             assert_eq!(out, object);
-            assert_eq!(query(object, &[0; 16], &mut out), E_NOINTERFACE);
+            out = std::ptr::null();
+            assert_eq!(query(object, self_iid, &mut out), S_OK);
+            assert_eq!(out, object);
+            // Another interface's id is not ours.
+            let foreign = if *self_iid == IID_IGAMEINPUT {
+                &IID_IGAMEINPUT_DEVICE
+            } else {
+                &IID_IGAMEINPUT
+            };
+            assert_eq!(query(object, foreign, &mut out), E_NOINTERFACE);
             assert!(out.is_null());
             out = object;
             assert_eq!(query(object, std::ptr::null(), &mut out), E_POINTER);
@@ -1681,9 +1920,11 @@ mod tests {
                 E_POINTER
             );
         }
-        assert_eq!(reading.refs.load(Ordering::Relaxed), 2);
+        // IUnknown once and own iid once; the reading started at 1.
+        assert_eq!(reading.refs.load(Ordering::Relaxed), 3);
         drop(reading);
         let release = slot::<extern "system" fn(*const Reading) -> u32, _>(reading_ptr, 0x10);
+        assert_eq!(release(reading_ptr), 1);
         assert_eq!(release(reading_ptr), 0);
     }
 
@@ -1830,6 +2071,53 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn scripted_keys_press_the_first_host_pad_while_it_hides_the_stand_in() {
+        let (hub, host) = fake();
+        // A receiver answering for its switched-off pad: a pad at rest in
+        // slot 1, a pad held left in slot 3.
+        let held = PadState {
+            left_x: -0.5,
+            ..Default::default()
+        };
+        {
+            let mut host = host.lock().unwrap();
+            host.pads[1] = Some(PadState::default());
+            host.pads[3] = Some(held);
+            host.scripted = vec![0x0D, b'D'];
+            host.keys = vec![key(0x0D), key(b'D')];
+        }
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(
+            pad(r),
+            PadState {
+                buttons: A,
+                left_x: 1.0,
+                ..Default::default()
+            }
+        );
+        release(r);
+        let r = current(hub, GAMEPAD_KIND, 3).unwrap();
+        assert_eq!(pad(r), held);
+        release(r);
+
+        // Released, the pad reads what the host reports again.
+        {
+            let mut host = host.lock().unwrap();
+            host.scripted.clear();
+            host.keys.clear();
+        }
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
     }
 
     #[test]

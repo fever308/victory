@@ -1101,6 +1101,10 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An R32F texture SRV (width, height, texels): a depth texture's view,
+    /// which comparison sampling needs (RGBA32F does not support it, and
+    /// NVIDIA then returns the texels uncompared).
+    DepthTexture(u32, u32, &'a [f32]),
     /// An RGBA32F cube SRV (face size, mip count, texels by face then mip).
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1209,20 +1213,16 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
-            let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // Texel words: 4 for RGBA32F, 1 for the 32-bit formats.
+            let footprint_in = |r: &ID3D12Resource, w: u32, h: u32, words: u32, format| {
+                D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
-                                },
+                                Format: format,
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
@@ -1230,8 +1230,16 @@ impl Host {
                             },
                         },
                     },
+                }
+            };
+            let footprint_as = |r: &ID3D12Resource, w: u32, h: u32, words: u32| {
+                let format = if words == 1 {
+                    DXGI_FORMAT_R32_UINT
+                } else {
+                    DXGI_FORMAT_R32G32B32A32_FLOAT
                 };
-            let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
+                footprint_in(r, w, h, words, format)
+            };
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1276,13 +1284,20 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces, levels) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-                            View::Cube(n, levels, t) => (n, n, t, 6, levels),
+                    View::Texture(..) | View::DepthTexture(..) | View::Cube(..) => {
+                        let rgba = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                        // (texels as floats, floats per texel, format)
+                        let (w, h, texels, words, format, faces, levels) = match *v {
+                            View::Texture(w, h, t) => (w, h, t.as_flattened(), 4, rgba, 1, 1),
+                            View::DepthTexture(w, h, t) => {
+                                (w, h, t, 1, DXGI_FORMAT_R32_FLOAT, 1, 1)
+                            }
+                            View::Cube(n, levels, t) => {
+                                (n, n, t.as_flattened(), 4, rgba, 6, levels)
+                            }
                             _ => unreachable!(),
                         };
-                        let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
+                        let mut desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, format);
                         desc.DepthOrArraySize = faces as u16;
                         desc.MipLevels = levels;
                         let tex = make(
@@ -1294,7 +1309,8 @@ impl Host {
                         for sub in 0..faces * u32::from(levels) {
                             let mip = sub % u32::from(levels);
                             let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
-                            let pitch = (w as usize * 16).next_multiple_of(256);
+                            let row_floats = w as usize * words as usize;
+                            let pitch = (row_floats * 4).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1302,14 +1318,14 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let pixels = &texels[start..start + (w * h) as usize];
+                            let pixels = &texels[start..start + row_floats * h as usize];
                             start += pixels.len();
                             for y in 0..h as usize {
-                                let row = &pixels[y * w as usize..(y + 1) * w as usize];
+                                let row = &pixels[y * row_floats..(y + 1) * row_floats];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
-                                    row.len() * 16,
+                                    row.len() * 4,
                                 );
                             }
                             upload.Unmap(0, None);
@@ -1320,7 +1336,7 @@ impl Host {
                                 0,
                                 0,
                                 0,
-                                &footprint(&upload, w, h),
+                                &footprint_in(&upload, w, h, words, format),
                                 None,
                             );
                             keep.push(upload);
