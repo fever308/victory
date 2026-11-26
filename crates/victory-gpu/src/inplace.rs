@@ -375,9 +375,49 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 /// for a range stands while it does not.
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_GENERATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestGenerationGuard(Option<u64>);
+
+#[cfg(test)]
+impl Drop for TestGenerationGuard {
+    fn drop(&mut self) {
+        TEST_GENERATION.with(|c| c.set(self.0));
+    }
+}
+
+/// Test helper: isolates [`generation`] on the current thread so unrelated
+/// concurrent tests registering or removing views cannot perturb generation
+/// checks in deterministic tests. View changes on this thread still advance
+/// its local counter.
+#[cfg(test)]
+pub(crate) fn isolate_generation_for_test() -> TestGenerationGuard {
+    let prev = TEST_GENERATION.with(|c| c.replace(Some(1)));
+    TestGenerationGuard(prev)
+}
+
+#[inline]
+fn bump_generation() {
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    TEST_GENERATION.with(|c| {
+        if let Some(v) = c.get() {
+            c.set(Some(v.wrapping_add(1)));
+        }
+    });
+}
+
 /// The views' generation ([`GENERATION`]).
 #[allow(dead_code)]
 pub(crate) fn generation() -> u64 {
+    #[cfg(test)]
+    if let Some(local) = TEST_GENERATION.with(std::cell::Cell::get) {
+        return local;
+    }
     GENERATION.load(Ordering::SeqCst)
 }
 
@@ -508,7 +548,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) -> 
                 .push(at + k * K64);
         }
     }
-    GENERATION.fetch_add(1, Ordering::SeqCst);
+    bump_generation();
     // This view is writable from now on (unless lazy materialization failed
     // and armed it at `PAGE_NOACCESS`): a guard over the same bytes at another
     // view must look at them again, and the pages are noted written there
@@ -559,7 +599,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
-    GENERATION.fetch_add(1, Ordering::SeqCst);
+    bump_generation();
 }
 
 /// How many bytes of `[at, at + len)` views of physical pages show; `None`

@@ -1877,6 +1877,9 @@ fn detach_remapped_vas_locked(
     let Some(mut entry) = table.pages.remove(&primary) else {
         return (None, None);
     };
+    let old_primary = entry.armed_vas.first().copied();
+    let old_sub_off = old_primary.map_or(0, |a| a.va % PAGE);
+    let base_offset = entry.offset.saturating_sub(old_sub_off);
     let shadow_ptr = Arc::as_ptr(&entry.shadow) as usize;
     if let Some(blocks) = table.by_shadow.get_mut(&shadow_ptr) {
         blocks.remove(&primary);
@@ -1903,13 +1906,14 @@ fn detach_remapped_vas_locked(
     if surviving.is_empty() {
         return (Some(entry), None);
     }
-    // Prefer a surviving alias covering the full `entry.len`; otherwise pick the
-    // longest surviving alias and clamp `entry.len` so `own_view_ptr` never
-    // rejects future merges against a shorter promoted view.
+    // Prefer a surviving alias covering the full 64 KiB page; otherwise pick the
+    // longest surviving alias and recompute `entry.offset` / `entry.len` from
+    // the block's page-aligned base offset so repeated promotions are idempotent
+    // and never double-shift `entry.offset` or shrink `entry.len` toward zero.
     let best_idx = surviving
         .iter()
         .enumerate()
-        .find(|(_, a)| a.va.is_multiple_of(PAGE) && a.len >= entry.len)
+        .find(|(_, a)| a.va.is_multiple_of(PAGE) && a.len >= PAGE)
         .or_else(|| surviving.iter().enumerate().max_by_key(|(_, a)| a.len))
         .map(|(i, _)| i)
         .unwrap_or(0);
@@ -1918,13 +1922,10 @@ fn detach_remapped_vas_locked(
     }
     let promoted = surviving[0];
     let new_primary = promoted.va / PAGE;
-    let sub_off = promoted.va % PAGE;
-    if sub_off != 0 {
-        entry.offset = entry.offset.saturating_add(sub_off);
-        entry.len = entry.len.saturating_sub(sub_off);
-    }
-    if promoted.len < entry.len {
-        entry.len = promoted.len;
+    if old_primary != Some(promoted) {
+        let sub_off = promoted.va % PAGE;
+        entry.offset = base_offset.saturating_add(sub_off);
+        entry.len = (PAGE - sub_off).min(promoted.len);
     }
     entry.armed_vas = surviving;
     for &armed in &entry.armed_vas {
@@ -5948,36 +5949,17 @@ mod tests {
         ) {
             let shadow_ptr = Arc::as_ptr(&shadow) as usize;
             let single_ptr_id = Arc::as_ptr(&single_shadow) as usize;
-
-            // Retry boundedly ONLY when an unrelated parallel test bumps
-            // `inplace::generation()` between `try_defer_page_inner`'s snapshot
-            // and recheck, re-establishing guards before each attempt.
-            fn arm_with_retry(target: &Arc<Shadow>, mut setup_guards: impl FnMut()) {
-                for _ in 0..16 {
-                    setup_guards();
-                    let gen_before = crate::inplace::generation();
-                    if try_defer_page_inner(target, 0, PAGE, 0) {
-                        return;
-                    }
-                    assert_ne!(
-                        crate::inplace::generation(),
-                        gen_before,
-                        "try_defer_page_inner failed without an unrelated inplace::generation() change"
-                    );
-                }
-                panic!("try_defer_page_inner failed after 16 retries due to concurrent view churn");
-            }
+            let _iso_gen = crate::inplace::isolate_generation_for_test();
 
             {
                 let _no_vg = crate::watch::disable_view_guard_for_test();
 
                 // 1. With `VICTORY_VIEW_GUARD=0`, guarding primary A leaves alias B writable
                 //    (`PAGE_READWRITE`). Arming A MUST invalidate `cpu_clean_after` (`None`).
-                arm_with_retry(&shadow, || {
-                    assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
-                    assert_eq!(query_protect(va_a), PAGE_READONLY);
-                    assert_eq!(query_protect(va_b), PAGE_READWRITE);
-                });
+                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                assert_eq!(query_protect(va_a), PAGE_READONLY);
+                assert_eq!(query_protect(va_b), PAGE_READWRITE);
+                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
                 assert_eq!(query_protect(va_a), PAGE_NOACCESS);
                 assert_eq!(query_protect(va_b), PAGE_NOACCESS);
                 assert_eq!(
@@ -5990,12 +5972,11 @@ mod tests {
 
                 // 2. Even if both A and B were independently guarded while `VICTORY_VIEW_GUARD=0`,
                 //    cross-alias write tracking is off, so `cpu_clean_after` MUST still be `None`.
-                arm_with_retry(&shadow, || {
-                    assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
-                    assert!(crate::watch::writes(va_b, va_b + PAGE, true).is_some());
-                    assert_eq!(query_protect(va_a), PAGE_READONLY);
-                    assert_eq!(query_protect(va_b), PAGE_READONLY);
-                });
+                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                assert!(crate::watch::writes(va_b, va_b + PAGE, true).is_some());
+                assert_eq!(query_protect(va_a), PAGE_READONLY);
+                assert_eq!(query_protect(va_b), PAGE_READONLY);
+                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
                 assert_eq!(
                     owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1),
                     vec![(blk_a, None)],
@@ -6006,10 +5987,9 @@ mod tests {
 
                 // 3. A single guarded view (no aliases) STILL retains its zero-DMA clean proof
                 //    even when `VICTORY_VIEW_GUARD=0`.
-                arm_with_retry(&single_shadow, || {
-                    assert!(crate::watch::writes(single_va, single_va + PAGE, true).is_some());
-                    assert_eq!(query_protect(single_va), PAGE_READONLY);
-                });
+                assert!(crate::watch::writes(single_va, single_va + PAGE, true).is_some());
+                assert_eq!(query_protect(single_va), PAGE_READONLY);
+                assert!(try_defer_page_inner(&single_shadow, 0, PAGE, 0));
                 let single_clean =
                     owned_blocks_with_clean_in(single_ptr_id, single_blk, single_blk + 1);
                 assert_eq!(single_clean.len(), 1);
@@ -6025,11 +6005,10 @@ mod tests {
             // 4. With view-guarding enabled, guarding A guards BOTH A and B read-only, so
             //    arming A preserves the zero-DMA clean proof (`Some(_)`).
             if crate::watch::view_guard_enabled_for_test() {
-                arm_with_retry(&shadow, || {
-                    assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
-                    assert_eq!(query_protect(va_a), PAGE_READONLY);
-                    assert_eq!(query_protect(va_b), PAGE_READONLY);
-                });
+                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                assert_eq!(query_protect(va_a), PAGE_READONLY);
+                assert_eq!(query_protect(va_b), PAGE_READONLY);
+                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
                 let aliased_clean = owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1);
                 assert_eq!(aliased_clean.len(), 1);
                 assert_eq!(aliased_clean[0].0, blk_a);
@@ -6270,6 +6249,229 @@ mod tests {
         crate::watch::title_memory_remapped(va_b, SUB_LEN);
         // SAFETY: cleanup.
         unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view_b.Value,
+            });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view_a.Value,
+            });
+            CloseHandle(section);
+        }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_unaligned_alias_promotion_is_idempotent_across_repeated_discards() {
+        const SUB_OFF: usize = 4096;
+        const SUB_LEN: usize = 4096;
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let _iso_gen = crate::inplace::isolate_generation_for_test();
+        // SAFETY: 1-page (64 KiB) anonymous section mapped at primary A and aliases B, C.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: mapping 64 KiB view A.
+        let view_a = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        // SAFETY: mapping 64 KiB view B.
+        let view_b = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        // SAFETY: mapping 64 KiB view C.
+        let view_c = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view_a.Value.is_null() && !view_b.Value.is_null() && !view_c.Value.is_null());
+        let va_a = view_a.Value as usize;
+        let va_b = view_b.Value as usize;
+        let va_c = view_c.Value as usize;
+        let blk_a = va_a / PAGE;
+        let blk_b = va_b / PAGE;
+        let blk_c = va_c / PAGE;
+        clear_hot_for_test(blk_a);
+        clear_hot_for_test(blk_b);
+        clear_hot_for_test(blk_c);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va_a,
+            PAGE,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed physical page with `0x11`.
+        unsafe { ptr::write_bytes(va_a as *mut u8, 0x11, PAGE) };
+
+        if let Some((shadow, _side)) = make_card_shadow_at(va_a as u64, 1, 0x11) {
+            // Write distinct GPU bytes into each 4 KiB slice so any offset shift
+            // or zero-length truncation is immediately observable on materialize.
+            gpu_write_shadow(&shadow, 0, &[0xAA; 64]);
+            gpu_write_shadow(&shadow, SUB_OFF, &[0xBB; 64]);
+            gpu_write_shadow(&shadow, 2 * SUB_OFF, &[0xCC; 64]);
+            gpu_write_shadow(&shadow, 3 * SUB_OFF, &[0xDD; 64]);
+
+            // Part 1: Promote unaligned short alias B (with failed materialization),
+            // then discard a second alias C. `entry.offset` and `entry.len` must NOT
+            // be double-shifted, and subsequent materialization through B must succeed.
+            assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+            set_fail_next_fetches_for_test(1);
+            assert!(!crate::inplace::title_memory_view(
+                va_b + SUB_OFF,
+                2 * SUB_LEN,
+                section as usize,
+                SUB_OFF as u64,
+            ));
+            set_fail_next_fetches_for_test(1);
+            assert!(!crate::inplace::title_memory_view(
+                va_c + 3 * SUB_OFF,
+                SUB_LEN,
+                section as usize,
+                (3 * SUB_OFF) as u64,
+            ));
+            assert!(has_block(blk_a) && has_block(blk_b) && has_block(blk_c));
+
+            // Discard A while retire-materialize fails: promotes longer unaligned B at `SUB_OFF`.
+            set_fail_next_fetches_for_test(1);
+            discard_range(va_a, PAGE);
+            {
+                let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = table.pages.get(&blk_b).expect("B promoted as primary");
+                assert_eq!(
+                    entry.armed_vas[0],
+                    ArmedVa {
+                        va: va_b + SUB_OFF,
+                        len: 2 * SUB_LEN,
+                    }
+                );
+                assert_eq!(entry.offset, SUB_OFF);
+                assert_eq!(entry.len, 2 * SUB_LEN);
+            }
+
+            // Discard C while unaligned B is already `armed_vas[0]`: must be idempotent.
+            discard_range(va_c, PAGE);
+            {
+                let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = table.pages.get(&blk_b).expect("B still primary");
+                assert_eq!(
+                    entry.armed_vas,
+                    vec![ArmedVa {
+                        va: va_b + SUB_OFF,
+                        len: 2 * SUB_LEN,
+                    }]
+                );
+                assert_eq!(
+                    entry.offset, SUB_OFF,
+                    "discarding a non-primary alias must not double-shift entry.offset"
+                );
+                assert_eq!(
+                    entry.len,
+                    2 * SUB_LEN,
+                    "discarding a non-primary alias must not shrink entry.len"
+                );
+            }
+
+            assert!(materialize_range(va_b + SUB_OFF, 2 * SUB_LEN));
+            assert!(!has_block(blk_b));
+            assert!(is_readable_now(va_b + SUB_OFF));
+            // SAFETY: B slice is restored to PAGE_READWRITE and holds merged GPU bytes.
+            let got_b0 = unsafe { std::slice::from_raw_parts((va_b + SUB_OFF) as *const u8, 64) };
+            // SAFETY: second 4 KiB of B slice is also restored to PAGE_READWRITE.
+            let got_b1 =
+                unsafe { std::slice::from_raw_parts((va_b + 2 * SUB_OFF) as *const u8, 64) };
+            assert_eq!(got_b0, &[0xBB; 64]);
+            assert_eq!(got_b1, &[0xCC; 64]);
+
+            // Part 2: Promoting from unaligned alias B (`SUB_OFF`, len `2 * SUB_LEN`) to
+            // a DIFFERENT unaligned alias C (`3 * SUB_OFF`, len `SUB_LEN`) must recompute
+            // `entry.offset` from the page base (`3 * SUB_OFF`, not `4 * SUB_OFF`).
+            let mut old = 0u32;
+            // SAFETY: restoring RW on views still mapped in this test.
+            unsafe {
+                VirtualProtect(va_a as *const _, PAGE, PAGE_READWRITE, &mut old);
+                VirtualProtect(va_b as *const _, PAGE, PAGE_READWRITE, &mut old);
+                VirtualProtect(va_c as *const _, PAGE, PAGE_READWRITE, &mut old);
+                ptr::write_bytes(va_a as *mut u8, 0x11, PAGE);
+            }
+            crate::inplace::views_gone(va_b, PAGE);
+            crate::inplace::views_gone(va_c, PAGE);
+            clear_hot_for_test(blk_a);
+            clear_hot_for_test(blk_b);
+            clear_hot_for_test(blk_c);
+
+            assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+            set_fail_next_fetches_for_test(1);
+            assert!(!crate::inplace::title_memory_view(
+                va_b + SUB_OFF,
+                2 * SUB_LEN,
+                section as usize,
+                SUB_OFF as u64,
+            ));
+            set_fail_next_fetches_for_test(1);
+            assert!(!crate::inplace::title_memory_view(
+                va_c + 3 * SUB_OFF,
+                SUB_LEN,
+                section as usize,
+                (3 * SUB_OFF) as u64,
+            ));
+
+            // Discard A (promotes longer unaligned B, fail materialize).
+            set_fail_next_fetches_for_test(1);
+            discard_range(va_a, PAGE);
+            {
+                let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = table.pages.get(&blk_b).expect("B promoted as primary");
+                assert_eq!(entry.offset, SUB_OFF);
+                assert_eq!(entry.len, 2 * SUB_LEN);
+            }
+
+            // Discard B (promotes unaligned C, fail materialize).
+            set_fail_next_fetches_for_test(1);
+            discard_range(va_b, PAGE);
+            {
+                let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = table.pages.get(&blk_c).expect("C promoted as primary");
+                assert_eq!(
+                    entry.offset,
+                    3 * SUB_OFF,
+                    "re-promoting from unaligned B to unaligned C must not accumulate offsets"
+                );
+                assert_eq!(entry.len, SUB_LEN);
+            }
+
+            assert!(materialize_range(va_c + 3 * SUB_OFF, SUB_LEN));
+            assert!(!has_block(blk_c));
+            assert!(is_readable_now(va_c + 3 * SUB_OFF));
+            // SAFETY: C slice is restored to PAGE_READWRITE and holds merged GPU bytes.
+            let got_c =
+                unsafe { std::slice::from_raw_parts((va_c + 3 * SUB_OFF) as *const u8, 64) };
+            assert_eq!(got_c, &[0xDD; 64]);
+
+            // SAFETY: restore RW on views still mapped before cleanup.
+            unsafe {
+                VirtualProtect(va_a as *const _, PAGE, PAGE_READWRITE, &mut old);
+                VirtualProtect(va_b as *const _, PAGE, PAGE_READWRITE, &mut old);
+                VirtualProtect(va_c as *const _, PAGE, PAGE_READWRITE, &mut old);
+            }
+            drop(shadow);
+        }
+
+        clear_hot_for_test(blk_a);
+        clear_hot_for_test(blk_b);
+        clear_hot_for_test(blk_c);
+        crate::watch::title_memory_remapped(va_a, PAGE);
+        crate::watch::title_memory_remapped(va_b, PAGE);
+        crate::watch::title_memory_remapped(va_c, PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view_c.Value,
+            });
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: view_b.Value,
             });

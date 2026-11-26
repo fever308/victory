@@ -9400,12 +9400,37 @@ mod tests {
 
     #[test]
     fn card_staging_publication_and_dirty_marking_are_atomic_with_relay_merge() {
-        use std::sync::{Barrier, Condvar};
+        use std::sync::Condvar;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             PAGE_READWRITE, UnmapViewOfFile,
         };
+
+        struct HookSync {
+            hook_entered: bool,
+            refresh_finished: bool,
+            worker_ready: bool,
+            worker_exited: bool,
+        }
+        struct WorkerExitGuard(Arc<(Mutex<HookSync>, Condvar)>);
+        impl Drop for WorkerExitGuard {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.0;
+                let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                s.worker_exited = true;
+                cv.notify_all();
+            }
+        }
+        struct FinishGapGuard(Arc<(Mutex<HookSync>, Condvar)>);
+        impl Drop for FinishGapGuard {
+            fn drop(&mut self) {
+                let (lock, cv) = &*self.0;
+                let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                s.refresh_finished = true;
+                cv.notify_all();
+            }
+        }
 
         let Some(_h) = host() else {
             return;
@@ -9445,13 +9470,20 @@ mod tests {
                 .expect("card shadow");
             shadow.clear_card_dirty_for_test();
 
-            // (entered_hook, refresh_finished) so `merge_thread` exits cleanly
-            // instead of deadlocking at `join` if a refresh skips the hook.
-            let entered_gap = Arc::new((Mutex::new((false, false)), Condvar::new()));
-            let merge_ready = Arc::new(Barrier::new(2));
+            // Coordinate hook entry, worker readiness, refresh completion, and
+            // timeouts under a single mutex+condvar so neither thread can ever
+            // hang under any scheduling order or timeout.
+            let hook_sync = Arc::new((
+                Mutex::new(HookSync {
+                    hook_entered: false,
+                    refresh_finished: false,
+                    worker_ready: false,
+                    worker_exited: false,
+                }),
+                Condvar::new(),
+            ));
             let lock_was_exclusive = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let entered_cb = entered_gap.clone();
-            let ready_cb = merge_ready.clone();
+            let sync_cb = hook_sync.clone();
             let exclusive_cb = lock_was_exclusive.clone();
             let shadow_cb = shadow.clone();
             BETWEEN_PUBLISH_AND_DIRTY_HOOK.with(|h| {
@@ -9460,40 +9492,63 @@ mod tests {
                     // `shadow.before` MUST be write-locked so `card_merge_relay_inner` cannot
                     // observe the new `0x77` staging bytes without their `card.dirty` range.
                     exclusive_cb.store(shadow_cb.before.try_read().is_err(), Ordering::SeqCst);
-                    {
-                        let mut g = entered_cb.0.lock().unwrap();
-                        g.0 = true;
-                        entered_cb.1.notify_all();
-                    }
-                    ready_cb.wait();
-                }));
-            });
-
-            let shadow_t2 = shadow.clone();
-            let entered_t2 = entered_gap.clone();
-            let ready_t2 = merge_ready.clone();
-            let merge_thread = std::thread::spawn(move || {
-                let hook_fired = {
-                    let mut g = entered_t2.0.lock().unwrap();
+                    let (lock, cv) = &*sync_cb;
+                    let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    s.hook_entered = true;
+                    cv.notify_all();
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                    while !g.0 && !g.1 {
+                    while !s.worker_ready && !s.worker_exited {
                         let remaining =
                             deadline.saturating_duration_since(std::time::Instant::now());
                         if remaining.is_zero() {
                             break;
                         }
-                        let (guard, timeout) = entered_t2.1.wait_timeout(g, remaining).unwrap();
-                        g = guard;
+                        let (guard, timeout) = cv
+                            .wait_timeout(s, remaining)
+                            .unwrap_or_else(|e| e.into_inner());
+                        s = guard;
                         if timeout.timed_out() {
                             break;
                         }
                     }
-                    g.0
+                }));
+            });
+
+            let shadow_t2 = shadow.clone();
+            let sync_t2 = hook_sync.clone();
+            let merge_thread = std::thread::spawn(move || {
+                let _worker_exit = WorkerExitGuard(sync_t2.clone());
+                let hook_fired = {
+                    let (lock, cv) = &*sync_t2;
+                    let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !s.hook_entered && !s.refresh_finished {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let (guard, timeout) = cv
+                            .wait_timeout(s, remaining)
+                            .unwrap_or_else(|e| e.into_inner());
+                        s = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
+                    }
+                    if s.hook_entered {
+                        s.worker_ready = true;
+                        cv.notify_all();
+                        true
+                    } else {
+                        s.worker_exited = true;
+                        cv.notify_all();
+                        false
+                    }
                 };
                 if !hook_fired {
                     return None;
                 }
-                ready_t2.wait();
                 // Stale GPU bytes (`0x11`, matching old staging) arrive right as staging
                 // was published to `0x77`: must block on `self.before.read()` until
                 // `card.dirty` is recorded, then skip the dirty range instead of
@@ -9507,16 +9562,8 @@ mod tests {
                 )
             });
 
-            struct FinishGapGuard(Arc<(Mutex<(bool, bool)>, Condvar)>);
-            impl Drop for FinishGapGuard {
-                fn drop(&mut self) {
-                    let mut g = self.0.0.lock().unwrap();
-                    g.1 = true;
-                    self.0.1.notify_all();
-                }
-            }
             {
-                let _finish_gap = FinishGapGuard(entered_gap.clone());
+                let _finish_gap = FinishGapGuard(hook_sync.clone());
                 if use_batch {
                     // Include a second empty-span shadow so `refresh_batch` takes
                     // the multi-shadow batch path (`items.len() >= 2`) rather than
